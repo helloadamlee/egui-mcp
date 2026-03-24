@@ -1,0 +1,20 @@
+[package]
+name = "demo-app-win"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+egui-mcp-client-win = { path = "../../crates/egui-mcp-client-win" }
+
+[dev-dependencies]
+egui_kittest = "0.31"  # For testing!
+
+[[test]]
+name = "demo_app_tests"
+path = "tests/demo_app_tests.rs"

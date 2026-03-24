@@ -1,0 +1,42 @@
+[package]
+name = "egui-mcp-client-win"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Windows APIs for screenshots and input
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+
+# Performance metrics
+lazy_static = "1.4"
+
+# Logging
+tracing = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "net", "time"] }
+
+# Image processing
+image = "0.25"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# egui for drawing highlights
+egui = "0.29"
+
+# Protocol definitions (local workspace)
+egui-mcp-protocol = { path = "../egui-mcp-protocol" }

@@ -1,0 +1,41 @@
+[package]
+name = "egui-mcp-server-win"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "io-util"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Base64 encoding
+base64 = "0.22"
+
+# Clipboard access
+clipboard-win = "5.4"
+
+# Windows UI Automation
+windows = { version = "0.58", features = [
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_Foundation",
+    "Win32_System_Variant",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
+
+# Protocol definitions (local workspace)
+egui-mcp-protocol = { path = "../egui-mcp-protocol" }
+egui-mcp-client-win = { path = "../egui-mcp-client-win" }
