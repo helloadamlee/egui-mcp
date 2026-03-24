@@ -180,6 +180,20 @@ fn assert_error_code(response: &Value, expected: i64) {
     );
 }
 
+fn assert_error_message_contains(response: &Value, expected_substring: &str) {
+    let message = response
+        .get("error")
+        .and_then(|err| err.get("message"))
+        .and_then(Value::as_str)
+        .expect("missing error.message");
+    assert!(
+        message.contains(expected_substring),
+        "expected error message to contain '{}', got '{}'",
+        expected_substring,
+        message
+    );
+}
+
 fn response_error_message(response: &Value) -> Option<String> {
     let error = response.get("error")?;
     if let Some(message) = error.get("message").and_then(Value::as_str) {
@@ -371,6 +385,12 @@ fn query_tools_reject_invalid_params_with_jsonrpc_invalid_params() {
         .send_request(6, "get_element", Some(json!({"element_id": ""})))
         .expect("empty element_id request failed");
     assert_error_code(&empty_element_id, -32602);
+
+    let unsupported_role = server
+        .send_request(7, "find_by_role", Some(json!({"role": "NotARealRole"})))
+        .expect("unsupported role request failed");
+    assert_error_code(&unsupported_role, -32000);
+    assert_error_message_contains(&unsupported_role, "Unsupported role");
 }
 
 #[test]
@@ -721,4 +741,88 @@ Set {}=1 to override.",
         changed.get("error").is_none(),
         "wait_for_value_change returned error"
     );
+}
+
+#[test]
+#[ignore = "requires demo-app-win running and reachable through UIA + IPC"]
+fn priority3_negative_paths_surface_timeout_and_unsupported_pattern_errors() {
+    if !live_tests_enabled() {
+        eprintln!(
+            "Skipping live UI test. Set {}=1 to run this test.",
+            LIVE_TESTS_ENV
+        );
+        return;
+    }
+    if !has_interactive_session_hint() && !force_live_tests_enabled() {
+        eprintln!(
+            "Skipping live UI test because no interactive session was detected (SESSIONNAME). \
+Set {}=1 to override.",
+            FORCE_LIVE_TESTS_ENV
+        );
+        return;
+    }
+
+    let mut server = ServerHarness::spawn();
+
+    let checkbox = server
+        .send_request(
+            300,
+            "find_by_label_exact",
+            Some(json!({"label": "Checkbox"})),
+        )
+        .expect("find_by_label_exact failed");
+    assert!(
+        checkbox.get("error").is_none(),
+        "find_by_label_exact returned error"
+    );
+
+    let checkbox_id = checkbox
+        .get("result")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .expect("expected non-empty checkbox element id");
+
+    let unsupported_pattern = server
+        .send_request(
+            301,
+            "set_element_value",
+            Some(json!({
+                "element_id": checkbox_id,
+                "value": "123"
+            })),
+        )
+        .expect("set_element_value request failed");
+    assert_error_code(&unsupported_pattern, -32000);
+    assert_error_message_contains(&unsupported_pattern, "does not support value setting");
+
+    let current_value = server
+        .send_request(
+            302,
+            "get_element_value",
+            Some(json!({"element_id": checkbox_id})),
+        )
+        .expect("get_element_value failed");
+    let baseline = current_value
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .and_then(Value::as_str)
+        .expect("missing value from get_element_value");
+
+    let timeout_response = server
+        .send_request(
+            303,
+            "wait_for_value_change",
+            Some(json!({
+                "element_id": checkbox_id,
+                "initial_value": baseline,
+                "timeout_ms": 150,
+                "poll_interval_ms": 25
+            })),
+        )
+        .expect("wait_for_value_change request failed");
+    assert_error_code(&timeout_response, -32000);
+    assert_error_message_contains(&timeout_response, "did not change");
 }

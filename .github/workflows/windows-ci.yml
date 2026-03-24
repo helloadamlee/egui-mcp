@@ -29,6 +29,9 @@ jobs:
       - name: Run server tests
         run: cargo test -p egui-mcp-server-win
 
+      - name: Run client tests
+        run: cargo test -p egui-mcp-client-win
+
       - name: Run demo app tests
         run: cargo test -p demo-app-win
 
@@ -38,6 +41,7 @@ jobs:
     timeout-minutes: 30
     env:
       EGUI_MCP_RUN_LIVE_TESTS: "1"
+      EGUI_MCP_FORCE_LIVE_TESTS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
