@@ -416,24 +416,17 @@ Use **Inspect.exe** (included with Windows SDK) to verify the UI Automation tree
 
 ```
 egui-mcp-win/
-├── Cargo.toml
-├── README.md
-├── crates/
-│   ├── egui-mcp-server-win/     # MCP server (UIA client)
-│   ├── egui-mcp-client-win/     # Client library for egui apps
-│   └── egui-mcp-protocol/       # Shared protocol definitions
-└── examples/
-    └── demo-app-win/            # Demo egui application
+|-- Cargo.toml
+|-- README.md
+|-- crates/
+|   |-- egui-mcp-server-win/     # MCP server (UIA client)
+|   |-- egui-mcp-client-win/     # Client library for egui apps
+|   `-- egui-mcp-protocol/       # Shared protocol definitions
+`-- .github/
+    `-- workflows/
 ```
 
 ## Development
-
-### Building the Demo App
-
-```bash
-cd examples/demo-app-win
-cargo run --release
-```
 
 ### Testing
 
@@ -453,12 +446,10 @@ cargo test -p egui-mcp-server-win --test mcp_jsonrpc_integration
 
 ### Live UI Tests (Interactive Windows Session Required)
 
-Live UI tests are opt-in and require a desktop session where UI Automation can access windows.
+Live UI tests require a target egui application running with AccessKit enabled and a desktop session where UI Automation can access windows. This repository no longer includes an in-tree demo app.
 
 ```bash
-# 1) Start the demo app in one terminal
-cargo run -p demo-app-win
-
+# 1) Start your target egui app in one terminal
 # 2) In another terminal, run the live Priority 2 MCP integration test
 set EGUI_MCP_RUN_LIVE_TESTS=1
 cargo test -p egui-mcp-server-win priority2_query_tools_succeed_against_live_demo_app -- --ignored --nocapture --test-threads=1
@@ -469,7 +460,6 @@ cargo test -p egui-mcp-server-win priority3_tools_succeed_against_live_demo_app 
 
 CI configuration:
 - `.github/workflows/windows-ci.yml` runs standard tests on `windows-latest`.
-- Live UI tests run only on manually triggered workflow dispatch and only on runners labeled `self-hosted`, `windows`, and `interactive`.
 
 ## Contributing
 

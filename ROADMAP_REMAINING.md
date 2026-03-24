@@ -2,6 +2,9 @@
 
 Last updated: 2026-03-24
 
+Note: `examples/demo-app-win` was removed from this repository during cleanup.
+Mentions of `demo-app-win` below are historical references to earlier validation runs.
+
 This file is the single source of truth for current Windows port status and remaining work.
 Historical snapshot/status files were removed during repository cleanup on 2026-03-24.
 
@@ -65,7 +68,7 @@ Still remaining for Milestone A/B:
 ## Priority 1: Unblock Semantic UI Automation
 
 1. Fix Windows UIA client stability and connection path in `crates/egui-mcp-server-win/src/uia_client.rs`.
-2. Verify UIA connectivity end-to-end with the demo app (`enable_accesskit`) and MCP server.
+2. Verify UIA connectivity end-to-end with a target app (`enable_accesskit`) and MCP server.
 3. Add/refresh tests for UIA startup, element lookup, and pattern support detection.
 
 Why this is first:
@@ -81,7 +84,7 @@ The following tools are listed as blocked by UIA and should be verified function
 5. `get_element`
 
 Definition of done:
-- Tool responds successfully against `demo-app-win`.
+- Tool responds successfully against a target app.
 - Error paths are descriptive for missing elements/unsupported patterns.
 - Tool behavior is documented in API docs.
 
@@ -96,10 +99,10 @@ Planned but not fully implemented/verified across docs:
 
 ## Priority 4: Testing and Quality Gate
 
-1. Add/finish `egui_kittest` coverage for demo app behavior.
+1. Add/finish `egui_kittest` coverage for a representative target app.
 2. Add integration tests for MCP JSON-RPC tool execution.
 3. Validate negative paths (timeouts, read-only controls, unsupported UIA patterns).
-4. Ensure CI runs tests for server/client/demo app on Windows.
+4. Ensure CI runs tests for server/client crates on Windows.
 
 ## Priority 5: Docs and Cleanup
 

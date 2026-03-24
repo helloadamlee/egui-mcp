@@ -3,7 +3,6 @@ members = [
     "crates/egui-mcp-protocol",
     "crates/egui-mcp-client-win",
     "crates/egui-mcp-server-win",
-    "examples/demo-app-win",
 ]
 
 resolver = "2"

@@ -453,7 +453,7 @@ fn priority3_tools_reject_invalid_params() {
 }
 
 #[test]
-#[ignore = "requires demo-app-win running and reachable through UIA + IPC"]
+#[ignore = "requires a target app running and reachable through UIA + IPC"]
 fn priority2_query_tools_succeed_against_live_demo_app() {
     if !live_tests_enabled() {
         eprintln!(
@@ -526,7 +526,7 @@ Set {}=1 to override.",
 }
 
 #[test]
-#[ignore = "requires demo-app-win running and reachable through UIA + IPC"]
+#[ignore = "requires a target app running and reachable through UIA + IPC"]
 fn priority3_tools_succeed_against_live_demo_app() {
     if !live_tests_enabled() {
         eprintln!(
@@ -744,7 +744,7 @@ Set {}=1 to override.",
 }
 
 #[test]
-#[ignore = "requires demo-app-win running and reachable through UIA + IPC"]
+#[ignore = "requires a target app running and reachable through UIA + IPC"]
 fn priority3_negative_paths_surface_timeout_and_unsupported_pattern_errors() {
     if !live_tests_enabled() {
         eprintln!(

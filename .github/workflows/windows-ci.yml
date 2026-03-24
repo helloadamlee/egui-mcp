@@ -6,12 +6,6 @@ on:
       - main
   pull_request:
   workflow_dispatch:
-    inputs:
-      run_live_ui_tests:
-        description: "Run live UI automation tests (requires self-hosted interactive Windows runner)"
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   windows-tests:
@@ -31,42 +25,3 @@ jobs:
 
       - name: Run client tests
         run: cargo test -p egui-mcp-client-win
-
-      - name: Run demo app tests
-        run: cargo test -p demo-app-win
-
-  live-ui-tests:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_live_ui_tests }}
-    runs-on: [self-hosted, windows, interactive]
-    timeout-minutes: 30
-    env:
-      EGUI_MCP_RUN_LIVE_TESTS: "1"
-      EGUI_MCP_FORCE_LIVE_TESTS: "1"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build binaries
-        run: cargo build -p demo-app-win -p egui-mcp-server-win
-
-      - name: Run live Priority 2 MCP integration test
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $demo = Start-Process cargo -ArgumentList 'run -p demo-app-win' -PassThru
-          try {
-            Start-Sleep -Seconds 8
-            cargo test -p egui-mcp-server-win priority2_query_tools_succeed_against_live_demo_app -- --ignored --nocapture --test-threads=1
-            cargo test -p egui-mcp-server-win priority3_tools_succeed_against_live_demo_app -- --ignored --nocapture --test-threads=1
-          }
-          finally {
-            if ($demo -and !$demo.HasExited) {
-              Stop-Process -Id $demo.Id -Force
-            }
-          }

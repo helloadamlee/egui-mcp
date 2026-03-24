@@ -1921,7 +1921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running demo-app-win with window title from EGUI_MCP_UIA_TEST_WINDOW"]
+    #[ignore = "requires running a target app with window title from EGUI_MCP_UIA_TEST_WINDOW"]
     async fn uia_live_window_lookup_and_pattern_support_smoke() {
         let window_title = std::env::var("EGUI_MCP_UIA_TEST_WINDOW")
             .unwrap_or_else(|_| "egui-mcp Demo".to_string());
@@ -1932,7 +1932,7 @@ mod tests {
             .await
             .expect("failed to find window by title");
 
-        // Prefer the checkbox in demo-app-win because it is expected to have Toggle support.
+        // Prefer a checkbox because it is expected to have Toggle support.
         let matches = client
             .find_elements_by_name(&window_title, "Checkbox", true)
             .await
@@ -1955,7 +1955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running demo-app-win with window title from EGUI_MCP_UIA_TEST_WINDOW"]
+    #[ignore = "requires running a target app with window title from EGUI_MCP_UIA_TEST_WINDOW"]
     async fn uia_live_priority2_query_tools_smoke() {
         let window_title = std::env::var("EGUI_MCP_UIA_TEST_WINDOW")
             .unwrap_or_else(|_| "egui-mcp Demo".to_string());
