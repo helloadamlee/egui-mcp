@@ -8,12 +8,12 @@ A Windows port of [egui-mcp](https://github.com/dijdzv/egui-mcp), enabling AI ag
 ## Current Project Status
 
 - Canonical roadmap for remaining work: `ROADMAP_REMAINING.md`
-- Current functional/blocked tool status details: `FUNCTIONAL_TOOLS.md`
+- Canonical API/tool reference: `API_REFERENCE.md`
 
 ## Features
 
 Note: This section lists the tool API surface and may include tools that depend on UIA readiness.
-For current verified status, see `FUNCTIONAL_TOOLS.md` and `ROADMAP_REMAINING.md`.
+For current verified status, see `ROADMAP_REMAINING.md`.
 
 ### Working Tools
 

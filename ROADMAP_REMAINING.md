@@ -2,13 +2,8 @@
 
 Last updated: 2026-03-24
 
-This file consolidates remaining work from:
-- FUNCTIONAL_TOOLS.md
-- HIGH_PRIORITY_TOOLS_IMPLEMENTED.md
-- MEDIUM_PRIORITY_TOOLS_IMPLEMENTED.md
-- WINDOWS_PORT_STATUS.md
-- projectguide.txt
-- egui-mcp-windows-project.md
+This file is the single source of truth for current Windows port status and remaining work.
+Historical snapshot/status files were removed during repository cleanup on 2026-03-24.
 
 ## Progress Update (2026-03-24)
 
@@ -112,11 +107,11 @@ Planned but not fully implemented/verified across docs:
 2. Update `README.md` and `API_REFERENCE.md` with authoritative tool status.
 3. Keep one status owner file (suggested: this file) and link all other docs to it.
 
-## Document Mismatches to Resolve
+## Status Ownership
 
-These are currently inconsistent and should be corrected as part of docs cleanup:
-1. `WINDOWS_PORT_STATUS.md` lists screenshot support as TODO.
-2. `FUNCTIONAL_TOOLS.md` lists `take_screenshot` and `screenshot_region` as working.
+1. Use this file for current status and remaining work.
+2. Use `API_REFERENCE.md` for API shape/parameters/examples.
+3. Use `README.md` for setup and top-level project guidance.
 
 ## Suggested Milestone Sequence
 
