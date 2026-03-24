@@ -1,0 +1,6 @@
+target/
+
+# Common editor/runtime noise
+.DS_Store
+Thumbs.db
+*.log
