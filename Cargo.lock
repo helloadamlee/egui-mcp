@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "egui-mcp-client-win"
-version = "0.1.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "egui 0.29.1",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "egui-mcp-protocol"
-version = "0.1.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "egui-mcp-server-win"
-version = "0.1.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "base64",
