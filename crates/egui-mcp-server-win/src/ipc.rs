@@ -11,6 +11,13 @@ pub struct IpcClient {
     pipe: Option<NamedPipeClient>,
 }
 
+fn format_error_message(err: egui_mcp_protocol::messages::ErrorMessage) -> String {
+    match err.details {
+        Some(details) if !details.trim().is_empty() => format!("{}: {}", err.message, details),
+        _ => err.message,
+    }
+}
+
 impl IpcClient {
     pub async fn new() -> Result<Self, String> {
         info!("Connecting to named pipe: {}", PIPE_NAME);
@@ -203,7 +210,7 @@ impl IpcClient {
                 use base64::{engine::general_purpose, Engine as _};
                 Ok(general_purpose::STANDARD.encode(&resp.image_data))
             }
-            IpcMessage::Error(err) => Err(err.message),
+            IpcMessage::Error(err) => Err(format_error_message(err)),
             _ => Err("Unexpected response".to_string()),
         }
     }
@@ -236,7 +243,7 @@ impl IpcClient {
                 use base64::{engine::general_purpose, Engine as _};
                 Ok(general_purpose::STANDARD.encode(&resp.image_data))
             }
-            IpcMessage::Error(err) => Err(err.message),
+            IpcMessage::Error(err) => Err(format_error_message(err)),
             _ => Err("Unexpected response".to_string()),
         }
     }

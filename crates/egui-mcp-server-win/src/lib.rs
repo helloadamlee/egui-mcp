@@ -1,13 +1,20 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 mod ipc;
+mod screenshot_core;
+mod snapshot_store;
 mod tools;
 mod uia_client;
 
 pub use ipc::IpcClient;
+use screenshot_core::{
+    compare_images, decode_png_base64, diff_images, encode_png_base64, parse_highlight_color,
+};
+use snapshot_store::SnapshotStore;
 pub use uia_client::{ElementInfo, Rect as UiaRect, UiaClient};
 
 const WINDOW_TITLE: &str = "egui-mcp Demo";
@@ -30,6 +37,49 @@ fn required_non_empty_string_param<'a>(
     }
 
     Ok(value)
+}
+
+fn required_non_empty_string_param_any<'a>(
+    params: &'a Value,
+    keys: &[&str],
+) -> std::result::Result<&'a str, String> {
+    for key in keys {
+        if let Some(value) = optional_non_empty_string_param(params, key) {
+            return Ok(value);
+        }
+    }
+
+    Err(format!(
+        "Missing required parameter '{}'",
+        keys.first().copied().unwrap_or("value")
+    ))
+}
+
+fn optional_non_empty_string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_unit_interval_param(
+    params: &Value,
+    key: &str,
+) -> std::result::Result<Option<f64>, String> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+
+    let Some(value) = value.as_f64() else {
+        return Err(format!("Parameter '{}' must be a number", key));
+    };
+
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("Parameter '{}' must be between 0.0 and 1.0", key));
+    }
+
+    Ok(Some(value))
 }
 
 fn flash_points_for_rect(rect: &UiaRect) -> Vec<(i32, i32)> {
@@ -55,15 +105,28 @@ pub struct McpServer<R: BufRead, W: Write> {
     writer: W,
     ipc_client: Option<IpcClient>,
     uia_client: Option<UiaClient>,
+    snapshot_store: Option<SnapshotStore>,
 }
 
 impl<R: BufRead, W: Write> McpServer<R, W> {
     pub fn new(reader: R, writer: W) -> Self {
+        let snapshot_store = match SnapshotStore::new() {
+            Ok(store) => Some(store),
+            Err(err) => {
+                warn!(
+                    "Screenshot snapshot store is unavailable; snapshot tools will fail: {}",
+                    err
+                );
+                None
+            }
+        };
+
         Self {
             reader,
             writer,
             ipc_client: None,
             uia_client: None,
+            snapshot_store,
         }
     }
 
@@ -224,6 +287,12 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             // Screenshot Tools
             "take_screenshot" => self.handle_take_screenshot(id).await,
             "screenshot_region" => self.handle_screenshot_region(id, params).await,
+            "screenshot_element" => self.handle_screenshot_element(id, params).await,
+            "compare_screenshots" => self.handle_compare_screenshots(id, params).await,
+            "diff_screenshots" => self.handle_diff_screenshots(id, params).await,
+            "save_snapshot" => self.handle_save_snapshot(id, params).await,
+            "load_snapshot" => self.handle_load_snapshot(id, params).await,
+            "diff_snapshots" => self.handle_diff_snapshots(id, params).await,
 
             // Convenience Tool
             "set_slider_value" => self.handle_set_slider_value(id, params).await,
@@ -465,21 +534,36 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         }
     }
 
+    async fn capture_screenshot_base64(
+        &mut self,
+        region: Option<UiaRect>,
+    ) -> std::result::Result<String, String> {
+        let Some(client) = self.ipc_client.as_mut() else {
+            return Err("IPC client not connected".to_string());
+        };
+
+        match region {
+            Some(region) => {
+                client
+                    .screenshot_region(region.x, region.y, region.width, region.height)
+                    .await
+            }
+            None => client.take_screenshot().await,
+        }
+    }
+
     // Handler: take_screenshot
     async fn handle_take_screenshot(&mut self, id: i64) -> Result<()> {
-        if let Some(client) = self.ipc_client.as_mut() {
-            match client.take_screenshot().await {
-                Ok(base64_image) => self.write_response(
-                    id,
-                    json!({
-                        "success": true,
-                        "image_base64": base64_image
-                    }),
-                ),
-                Err(e) => self.write_error(id, -32000, e),
-            }
-        } else {
-            self.write_error(id, -32001, "IPC client not connected".to_string())
+        match self.capture_screenshot_base64(None).await {
+            Ok(base64_image) => self.write_response(
+                id,
+                json!({
+                    "success": true,
+                    "image_base64": base64_image
+                }),
+            ),
+            Err(err) if err.contains("not connected") => self.write_error(id, -32001, err),
+            Err(err) => self.write_error(id, -32000, err),
         }
     }
 
@@ -490,20 +574,384 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let width = params.get("width").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
         let height = params.get("height").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
 
-        if let Some(client) = self.ipc_client.as_mut() {
-            match client.screenshot_region(x, y, width, height).await {
-                Ok(base64_image) => self.write_response(
+        if width <= 0 || height <= 0 {
+            return self.write_error(
+                id,
+                -32602,
+                "Parameters 'width' and 'height' must be greater than zero".to_string(),
+            );
+        }
+
+        let region = UiaRect {
+            x,
+            y,
+            width,
+            height,
+        };
+
+        match self.capture_screenshot_base64(Some(region)).await {
+            Ok(base64_image) => self.write_response(
+                id,
+                json!({
+                    "success": true,
+                    "image_base64": base64_image
+                }),
+            ),
+            Err(err) if err.contains("not connected") => self.write_error(id, -32001, err),
+            Err(err) => self.write_error(id, -32000, err),
+        }
+    }
+
+    // Handler: screenshot_element
+    async fn handle_screenshot_element(&mut self, id: i64, params: &Value) -> Result<()> {
+        let element_id = match required_non_empty_string_param(params, "element_id") {
+            Ok(value) => value,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+
+        let Some(uia) = &self.uia_client else {
+            return self.write_error(id, -32001, "UI Automation not available".to_string());
+        };
+
+        let element = match uia.get_element_by_id(WINDOW_TITLE, element_id).await {
+            Ok(element) => element,
+            Err(err) => {
+                return self.write_error(id, -32000, format!("Failed to resolve element: {}", err))
+            }
+        };
+
+        if element.bounds.width <= 0 || element.bounds.height <= 0 {
+            return self.write_error(
+                id,
+                -32000,
+                format!("Element '{}' has invalid bounds", element_id),
+            );
+        }
+
+        let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        if screen_width <= 0 || screen_height <= 0 {
+            return self.write_error(
+                id,
+                -32000,
+                "Failed to resolve screen dimensions".to_string(),
+            );
+        }
+
+        let left = element.bounds.x.max(0).min(screen_width);
+        let top = element.bounds.y.max(0).min(screen_height);
+        let right = (element.bounds.x + element.bounds.width)
+            .max(0)
+            .min(screen_width);
+        let bottom = (element.bounds.y + element.bounds.height)
+            .max(0)
+            .min(screen_height);
+
+        let clamped_width = right - left;
+        let clamped_height = bottom - top;
+
+        if clamped_width <= 0 || clamped_height <= 0 {
+            return self.write_error(
+                id,
+                -32000,
+                format!("Element '{}' is outside visible screen bounds", element_id),
+            );
+        }
+
+        let region = UiaRect {
+            x: left,
+            y: top,
+            width: clamped_width,
+            height: clamped_height,
+        };
+
+        match self.capture_screenshot_base64(Some(region)).await {
+            Ok(base64_image) => self.write_response(
+                id,
+                json!({
+                    "success": true,
+                    "element_id": element_id,
+                    "image_base64": base64_image,
+                    "bounds": {
+                        "x": left,
+                        "y": top,
+                        "width": clamped_width,
+                        "height": clamped_height
+                    }
+                }),
+            ),
+            Err(err) if err.contains("not connected") => self.write_error(id, -32001, err),
+            Err(err) => self.write_error(id, -32000, err),
+        }
+    }
+
+    // Handler: compare_screenshots
+    async fn handle_compare_screenshots(&mut self, id: i64, params: &Value) -> Result<()> {
+        let image_a = match required_non_empty_string_param_any(
+            params,
+            &["image_a_base64", "left_image_base64", "image_a"],
+        ) {
+            Ok(value) => value,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+        let image_b = match required_non_empty_string_param_any(
+            params,
+            &["image_b_base64", "right_image_base64", "image_b"],
+        ) {
+            Ok(value) => value,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+        let threshold = match optional_unit_interval_param(params, "threshold") {
+            Ok(Some(value)) => value,
+            Ok(None) => 0.99,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+
+        let left = match decode_png_base64(image_a) {
+            Ok(image) => image,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+        let right = match decode_png_base64(image_b) {
+            Ok(image) => image,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+
+        match compare_images(&left, &right, threshold) {
+            Ok(result) => self.write_response(
+                id,
+                json!({
+                    "success": true,
+                    "similarity": result.similarity,
+                    "match": result.is_match,
+                    "width": result.width,
+                    "height": result.height
+                }),
+            ),
+            Err(err) => self.write_error(id, -32000, err),
+        }
+    }
+
+    // Handler: diff_screenshots
+    async fn handle_diff_screenshots(&mut self, id: i64, params: &Value) -> Result<()> {
+        let image_a = match required_non_empty_string_param_any(
+            params,
+            &["image_a_base64", "left_image_base64", "image_a"],
+        ) {
+            Ok(value) => value,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+        let image_b = match required_non_empty_string_param_any(
+            params,
+            &["image_b_base64", "right_image_base64", "image_b"],
+        ) {
+            Ok(value) => value,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+
+        let sensitivity = match optional_unit_interval_param(params, "sensitivity") {
+            Ok(Some(value)) => value,
+            Ok(None) => 0.05,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+        let highlight_color =
+            match parse_highlight_color(optional_non_empty_string_param(params, "highlight_color"))
+            {
+                Ok(value) => value,
+                Err(message) => return self.write_error(id, -32602, message),
+            };
+
+        let left = match decode_png_base64(image_a) {
+            Ok(image) => image,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+        let right = match decode_png_base64(image_b) {
+            Ok(image) => image,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+
+        match diff_images(&left, &right, sensitivity, highlight_color) {
+            Ok(result) => match encode_png_base64(&result.diff_image) {
+                Ok(diff_image_base64) => self.write_response(
                     id,
                     json!({
                         "success": true,
-                        "image_base64": base64_image
+                        "diff_image_base64": diff_image_base64,
+                        "changed_pixels": result.changed_pixels,
+                        "change_ratio": result.change_ratio
                     }),
                 ),
-                Err(e) => self.write_error(id, -32000, e),
-            }
-        } else {
-            self.write_error(id, -32001, "IPC client not connected".to_string())
+                Err(err) => self.write_error(id, -32000, err),
+            },
+            Err(err) => self.write_error(id, -32000, err),
         }
+    }
+
+    // Handler: save_snapshot
+    async fn handle_save_snapshot(&mut self, id: i64, params: &Value) -> Result<()> {
+        let image_base64 = match optional_non_empty_string_param(params, "image_base64") {
+            Some(encoded) => encoded.to_string(),
+            None => match self.capture_screenshot_base64(None).await {
+                Ok(encoded) => encoded,
+                Err(err) if err.contains("not connected") => {
+                    return self.write_error(id, -32001, err)
+                }
+                Err(err) => return self.write_error(id, -32000, err),
+            },
+        };
+
+        let name = optional_non_empty_string_param(params, "name");
+        let label = optional_non_empty_string_param(params, "label");
+
+        let Some(store) = &self.snapshot_store else {
+            return self.write_error(
+                id,
+                -32001,
+                "Snapshot store is unavailable on this server".to_string(),
+            );
+        };
+
+        match store.save_snapshot(&image_base64, name, label) {
+            Ok(metadata) => self.write_response(
+                id,
+                json!({
+                    "success": true,
+                    "snapshot_id": metadata.id,
+                    "name": metadata.name,
+                    "label": metadata.label,
+                    "width": metadata.width,
+                    "height": metadata.height,
+                    "created_at_epoch_ms": metadata.created_at_epoch_ms
+                }),
+            ),
+            Err(err) => self.write_error(id, -32000, err),
+        }
+    }
+
+    // Handler: load_snapshot
+    async fn handle_load_snapshot(&mut self, id: i64, params: &Value) -> Result<()> {
+        let snapshot_id = optional_non_empty_string_param(params, "snapshot_id");
+        let name = optional_non_empty_string_param(params, "name");
+        if snapshot_id.is_none() && name.is_none() {
+            return self.write_error(
+                id,
+                -32602,
+                "Expected either parameter 'snapshot_id' or 'name'".to_string(),
+            );
+        }
+
+        let Some(store) = &self.snapshot_store else {
+            return self.write_error(
+                id,
+                -32001,
+                "Snapshot store is unavailable on this server".to_string(),
+            );
+        };
+
+        match store.load_snapshot(snapshot_id, name) {
+            Ok(loaded) => match encode_png_base64(&loaded.image) {
+                Ok(image_base64) => self.write_response(
+                    id,
+                    json!({
+                        "success": true,
+                        "snapshot_id": loaded.metadata.id,
+                        "name": loaded.metadata.name,
+                        "label": loaded.metadata.label,
+                        "width": loaded.metadata.width,
+                        "height": loaded.metadata.height,
+                        "created_at_epoch_ms": loaded.metadata.created_at_epoch_ms,
+                        "image_base64": image_base64
+                    }),
+                ),
+                Err(err) => self.write_error(id, -32000, err),
+            },
+            Err(err) => self.write_error(id, -32000, err),
+        }
+    }
+
+    // Handler: diff_snapshots
+    async fn handle_diff_snapshots(&mut self, id: i64, params: &Value) -> Result<()> {
+        let left_snapshot_id = optional_non_empty_string_param(params, "left_snapshot_id");
+        let left_name = optional_non_empty_string_param(params, "left_name");
+        let right_snapshot_id = optional_non_empty_string_param(params, "right_snapshot_id");
+        let right_name = optional_non_empty_string_param(params, "right_name");
+
+        if left_snapshot_id.is_none() && left_name.is_none() {
+            return self.write_error(
+                id,
+                -32602,
+                "Expected either 'left_snapshot_id' or 'left_name'".to_string(),
+            );
+        }
+        if right_snapshot_id.is_none() && right_name.is_none() {
+            return self.write_error(
+                id,
+                -32602,
+                "Expected either 'right_snapshot_id' or 'right_name'".to_string(),
+            );
+        }
+
+        let threshold = match optional_unit_interval_param(params, "threshold") {
+            Ok(Some(value)) => value,
+            Ok(None) => 0.99,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+        let sensitivity = match optional_unit_interval_param(params, "sensitivity") {
+            Ok(Some(value)) => value,
+            Ok(None) => 0.05,
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+        let highlight_color =
+            match parse_highlight_color(optional_non_empty_string_param(params, "highlight_color"))
+            {
+                Ok(value) => value,
+                Err(message) => return self.write_error(id, -32602, message),
+            };
+
+        let Some(store) = &self.snapshot_store else {
+            return self.write_error(
+                id,
+                -32001,
+                "Snapshot store is unavailable on this server".to_string(),
+            );
+        };
+
+        let left = match store.load_snapshot(left_snapshot_id, left_name) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+        let right = match store.load_snapshot(right_snapshot_id, right_name) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+
+        let compare = match compare_images(&left.image, &right.image, threshold) {
+            Ok(compare) => compare,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+        let diff = match diff_images(&left.image, &right.image, sensitivity, highlight_color) {
+            Ok(diff) => diff,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+        let diff_image_base64 = match encode_png_base64(&diff.diff_image) {
+            Ok(encoded) => encoded,
+            Err(err) => return self.write_error(id, -32000, err),
+        };
+
+        self.write_response(
+            id,
+            json!({
+                "success": true,
+                "left_snapshot_id": left.metadata.id,
+                "right_snapshot_id": right.metadata.id,
+                "similarity": compare.similarity,
+                "match": compare.is_match,
+                "width": compare.width,
+                "height": compare.height,
+                "diff_image_base64": diff_image_base64,
+                "changed_pixels": diff.changed_pixels,
+                "change_ratio": diff.change_ratio
+            }),
+        )
     }
 
     // Handler: set_slider_value (convenience method)
@@ -1541,6 +1989,18 @@ impl EguiMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::{kittest::Queryable, Harness};
+    use image::{Rgba, RgbaImage};
+
+    fn image_from_toggle_state(enabled: bool) -> RgbaImage {
+        let active = if enabled {
+            Rgba([20, 200, 120, 255])
+        } else {
+            Rgba([200, 60, 60, 255])
+        };
+
+        RgbaImage::from_fn(10, 10, |_x, _y| active)
+    }
 
     #[test]
     fn required_non_empty_string_param_accepts_trimmed_string() {
@@ -1577,5 +2037,50 @@ mod tests {
         assert_eq!(points.len(), 5);
         assert_eq!(points[0], (10, 20));
         assert_eq!(points[4], (25, 40));
+    }
+
+    #[test]
+    fn kittest_state_change_uses_shared_compare_and_diff_core() {
+        let mut harness = Harness::new_ui_state(
+            |ui, enabled| {
+                ui.checkbox(enabled, "Enable screenshots");
+            },
+            false,
+        );
+
+        let before = image_from_toggle_state(*harness.state());
+        harness.get_by_label("Enable screenshots").click();
+        harness.run();
+        let after = image_from_toggle_state(*harness.state());
+
+        let compare = compare_images(&before, &after, 0.99).expect("compare");
+        assert!(!compare.is_match);
+        assert!(compare.similarity < 0.99);
+
+        let diff = diff_images(&before, &after, 0.01, [255, 0, 0, 255]).expect("diff");
+        assert!(diff.changed_pixels > 0);
+        assert!(diff.change_ratio > 0.0);
+    }
+
+    #[test]
+    fn kittest_unchanged_state_matches_in_shared_core() {
+        let mut harness = Harness::new_ui_state(
+            |ui, enabled| {
+                ui.checkbox(enabled, "Enable screenshots");
+            },
+            false,
+        );
+
+        let before = image_from_toggle_state(*harness.state());
+        harness.run();
+        let after = image_from_toggle_state(*harness.state());
+
+        let compare = compare_images(&before, &after, 0.999).expect("compare");
+        assert!(compare.is_match);
+        assert_eq!(compare.similarity, 1.0);
+
+        let diff = diff_images(&before, &after, 0.01, [255, 0, 0, 255]).expect("diff");
+        assert_eq!(diff.changed_pixels, 0);
+        assert_eq!(diff.change_ratio, 0.0);
     }
 }

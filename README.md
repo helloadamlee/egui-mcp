@@ -44,10 +44,10 @@ egui Application  →  enable_accesskit()  →  AccessKit  →  UIA
 | `get_text`, `get/set_caret_position`, `get/set_text_selection` | ✅ AT-SPI Text | ❌ removed |
 | `get_value`, `set_value` | ✅ AT-SPI Value | ❌ replaced by `set_element_value` |
 | `is_visible`, `is_enabled`, `is_focused`, `is_checked` | ✅ AT-SPI State | ❌ removed |
-| `screenshot_element` | ✅ | ❌ removed |
+| `screenshot_element` | ✅ | ✅ restored |
 | `wait_for_state` | ✅ | ❌ removed |
-| `compare_screenshots`, `diff_screenshots` | ✅ | ❌ removed |
-| `save/load/diff_snapshots`, `diff_current` | ✅ | ❌ removed |
+| `compare_screenshots`, `diff_screenshots` | ✅ | ✅ restored |
+| `save/load/diff_snapshots` | ✅ | ✅ restored (`diff_current` pending) |
 | `get_frame_stats`, `start_perf_recording`, `get_perf_report` | ✅ | ❌ removed |
 | `get_logs`, `clear_logs` | ✅ | ❌ removed |
 | **`get_window_list`** | ❌ | ✅ **new** |
@@ -153,6 +153,11 @@ For full parameter schemas and JSON-RPC examples, see [`API_REFERENCE.md`](./API
 cargo test                          # all tests
 cargo test -p egui-mcp-server-win   # server only
 cargo test -p egui-mcp-server-win --test mcp_jsonrpc_integration
+cargo test -p egui-mcp-server-win kittest_ -- --nocapture
+
+# Screenshot compare/diff logic is shared by:
+# - runtime MCP handlers (compare_screenshots, diff_screenshots, snapshots)
+# - deterministic egui_kittest tests (fast validation, consistent behavior)
 
 # Live UI tests (requires a running egui app)
 set EGUI_MCP_RUN_LIVE_TESTS=1
@@ -168,3 +173,4 @@ CI: `.github/workflows/windows-ci.yml` on `windows-latest`.
 MIT OR Apache-2.0 — see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 Upstream project: [dijdzv/egui-mcp](https://github.com/dijdzv/egui-mcp). Thanks to the original authors.
+

@@ -5,6 +5,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::{engine::general_purpose, Engine as _};
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::{json, Value};
 
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -200,6 +202,15 @@ fn response_error_message(response: &Value) -> Option<String> {
         return Some(message.to_string());
     }
     Some(error.to_string())
+}
+
+fn png_base64(width: u32, height: u32, color: [u8; 4]) -> String {
+    let image = RgbaImage::from_fn(width, height, |_x, _y| Rgba(color));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut cursor, ImageFormat::Png)
+        .expect("encode png");
+    general_purpose::STANDARD.encode(cursor.into_inner())
 }
 
 fn clipboard_test_lock() -> &'static Mutex<()> {
@@ -450,6 +461,163 @@ fn priority3_tools_reject_invalid_params() {
         .send_request(13, "wait_for_value_change", Some(json!({})))
         .expect("wait_for_value_change request failed");
     assert_error_code(&wait_change_missing_element, -32602);
+}
+
+#[test]
+fn screenshot_compare_and_diff_reject_invalid_params() {
+    let mut server = ServerHarness::spawn();
+
+    let missing_compare_params = server
+        .send_request(500, "compare_screenshots", Some(json!({})))
+        .expect("compare_screenshots request failed");
+    assert_error_code(&missing_compare_params, -32602);
+
+    let invalid_threshold = server
+        .send_request(
+            501,
+            "compare_screenshots",
+            Some(json!({
+                "image_a_base64": png_base64(1, 1, [0, 0, 0, 255]),
+                "image_b_base64": png_base64(1, 1, [0, 0, 0, 255]),
+                "threshold": 1.5
+            })),
+        )
+        .expect("compare_screenshots invalid threshold request failed");
+    assert_error_code(&invalid_threshold, -32602);
+
+    let invalid_highlight_color = server
+        .send_request(
+            502,
+            "diff_screenshots",
+            Some(json!({
+                "image_a_base64": png_base64(1, 1, [0, 0, 0, 255]),
+                "image_b_base64": png_base64(1, 1, [255, 255, 255, 255]),
+                "highlight_color": "not-a-color"
+            })),
+        )
+        .expect("diff_screenshots invalid highlight color request failed");
+    assert_error_code(&invalid_highlight_color, -32602);
+}
+
+#[test]
+fn screenshot_compare_and_diff_require_matching_dimensions() {
+    let mut server = ServerHarness::spawn();
+
+    let mismatch = server
+        .send_request(
+            510,
+            "compare_screenshots",
+            Some(json!({
+                "image_a_base64": png_base64(1, 1, [0, 0, 0, 255]),
+                "image_b_base64": png_base64(2, 2, [0, 0, 0, 255])
+            })),
+        )
+        .expect("compare_screenshots mismatch request failed");
+    assert_error_code(&mismatch, -32000);
+    assert_error_message_contains(&mismatch, "dimensions");
+
+    let mismatch_diff = server
+        .send_request(
+            511,
+            "diff_screenshots",
+            Some(json!({
+                "image_a_base64": png_base64(1, 1, [0, 0, 0, 255]),
+                "image_b_base64": png_base64(2, 2, [0, 0, 0, 255])
+            })),
+        )
+        .expect("diff_screenshots mismatch request failed");
+    assert_error_code(&mismatch_diff, -32000);
+    assert_error_message_contains(&mismatch_diff, "dimensions");
+}
+
+#[test]
+fn snapshot_save_load_and_diff_round_trip_works_without_live_ipc() {
+    let mut server = ServerHarness::spawn();
+
+    let save_a = server
+        .send_request(
+            520,
+            "save_snapshot",
+            Some(json!({
+                "name": "test-snapshot-a",
+                "image_base64": png_base64(4, 4, [10, 10, 10, 255])
+            })),
+        )
+        .expect("save_snapshot A failed");
+    assert!(
+        save_a.get("error").is_none(),
+        "save_snapshot A returned error"
+    );
+    let snapshot_a_id = save_a
+        .get("result")
+        .and_then(|value| value.get("snapshot_id"))
+        .and_then(Value::as_str)
+        .expect("save_snapshot A missing snapshot_id")
+        .to_string();
+
+    let save_b = server
+        .send_request(
+            521,
+            "save_snapshot",
+            Some(json!({
+                "name": "test-snapshot-b",
+                "image_base64": png_base64(4, 4, [200, 40, 40, 255])
+            })),
+        )
+        .expect("save_snapshot B failed");
+    assert!(
+        save_b.get("error").is_none(),
+        "save_snapshot B returned error"
+    );
+    let snapshot_b_id = save_b
+        .get("result")
+        .and_then(|value| value.get("snapshot_id"))
+        .and_then(Value::as_str)
+        .expect("save_snapshot B missing snapshot_id")
+        .to_string();
+
+    let load_a = server
+        .send_request(
+            522,
+            "load_snapshot",
+            Some(json!({
+                "snapshot_id": snapshot_a_id
+            })),
+        )
+        .expect("load_snapshot A failed");
+    assert!(
+        load_a.get("error").is_none(),
+        "load_snapshot A returned error"
+    );
+    assert!(
+        load_a
+            .get("result")
+            .and_then(|value| value.get("image_base64"))
+            .and_then(Value::as_str)
+            .is_some(),
+        "load_snapshot A missing image_base64"
+    );
+
+    let diff = server
+        .send_request(
+            523,
+            "diff_snapshots",
+            Some(json!({
+                "left_snapshot_id": snapshot_a_id,
+                "right_snapshot_id": snapshot_b_id
+            })),
+        )
+        .expect("diff_snapshots failed");
+    assert!(diff.get("error").is_none(), "diff_snapshots returned error");
+    let changed_pixels = diff
+        .get("result")
+        .and_then(|value| value.get("changed_pixels"))
+        .and_then(Value::as_u64)
+        .expect("diff_snapshots missing changed_pixels");
+    assert!(
+        changed_pixels > 0,
+        "expected changed pixels for different snapshots"
+    );
 }
 
 #[test]

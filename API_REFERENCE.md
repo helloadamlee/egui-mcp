@@ -445,7 +445,7 @@ Capture the entire screen.
 ```json
 {
   "success": true,
-  "image_base64": "data:image/png;base64,..."
+  "image_base64": "<base64-encoded PNG bytes>"
 }
 ```
 
@@ -462,6 +462,139 @@ Capture a specific region.
 
 ---
 
+### `screenshot_element`
+Capture a specific UI element by `element_id`.
+
+**Parameters**:
+- `element_id` (string): UIA element id
+
+**Returns**:
+```json
+{
+  "success": true,
+  "element_id": "checkbox_1",
+  "image_base64": "<base64-encoded PNG bytes>",
+  "bounds": { "x": 100, "y": 120, "width": 220, "height": 32 }
+}
+```
+
+---
+
+### `compare_screenshots`
+Compare two PNG screenshots.
+
+**Parameters**:
+- `image_a_base64` (string): PNG base64 payload
+- `image_b_base64` (string): PNG base64 payload
+- `threshold` (number, optional, default `0.99`): match threshold in `[0.0, 1.0]`
+
+**Returns**:
+```json
+{
+  "success": true,
+  "similarity": 0.997,
+  "match": true,
+  "width": 1280,
+  "height": 720
+}
+```
+
+---
+
+### `diff_screenshots`
+Diff two PNG screenshots and return a highlighted diff PNG.
+
+**Parameters**:
+- `image_a_base64` (string): PNG base64 payload
+- `image_b_base64` (string): PNG base64 payload
+- `sensitivity` (number, optional, default `0.05`): per-pixel change threshold in `[0.0, 1.0]`
+- `highlight_color` (string, optional): `#RRGGBB` or `#RRGGBBAA`
+
+**Returns**:
+```json
+{
+  "success": true,
+  "diff_image_base64": "<base64-encoded PNG bytes>",
+  "changed_pixels": 1024,
+  "change_ratio": 0.0125
+}
+```
+
+---
+
+### `save_snapshot`
+Save a screenshot into the server-managed snapshot store.
+
+**Parameters**:
+- `image_base64` (string, optional): PNG base64 payload. If omitted, captures a full screenshot.
+- `name` (string, optional): logical name
+- `label` (string, optional): free-form metadata
+
+**Returns**:
+```json
+{
+  "success": true,
+  "snapshot_id": "snap-1742930000000-0",
+  "name": "checkout-before-submit",
+  "label": "baseline",
+  "width": 1280,
+  "height": 720,
+  "created_at_epoch_ms": 1742930000000
+}
+```
+
+---
+
+### `load_snapshot`
+Load a snapshot image + metadata from the server store.
+
+**Parameters**:
+- `snapshot_id` (string, optional)
+- `name` (string, optional): loads the most recent snapshot with that name
+
+**Returns**:
+```json
+{
+  "success": true,
+  "snapshot_id": "snap-1742930000000-0",
+  "name": "checkout-before-submit",
+  "label": "baseline",
+  "width": 1280,
+  "height": 720,
+  "created_at_epoch_ms": 1742930000000,
+  "image_base64": "<base64-encoded PNG bytes>"
+}
+```
+
+---
+
+### `diff_snapshots`
+Load two stored snapshots and diff them with the same core algorithm as `diff_screenshots`.
+
+**Parameters**:
+- `left_snapshot_id` / `left_name` (string)
+- `right_snapshot_id` / `right_name` (string)
+- `threshold` (number, optional, default `0.99`)
+- `sensitivity` (number, optional, default `0.05`)
+- `highlight_color` (string, optional): `#RRGGBB` or `#RRGGBBAA`
+
+**Returns**:
+```json
+{
+  "success": true,
+  "left_snapshot_id": "snap-1742930000000-0",
+  "right_snapshot_id": "snap-1742930100000-1",
+  "similarity": 0.982,
+  "match": false,
+  "width": 1280,
+  "height": 720,
+  "diff_image_base64": "<base64-encoded PNG bytes>",
+  "changed_pixels": 15432,
+  "change_ratio": 0.0167
+}
+```
+
+---
 ## 🎛️ Convenience Tools
 
 ### `set_slider_value`
@@ -636,5 +769,6 @@ All methods return errors in standard JSON-RPC format:
 **Last Updated**: Implementation of all High + Medium priority tools  
 **Build Status**: ✅ Compiled Successfully  
 **Ready for**: Production testing
+
 
 

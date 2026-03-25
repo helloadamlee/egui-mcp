@@ -1,6 +1,7 @@
-use anyhow::Result;
-use image::{ImageBuffer, Rgba};
+use anyhow::{anyhow, Result};
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use std::ffi::c_void;
+use std::io::Cursor;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -12,7 +13,15 @@ pub fn capture_screen(
 ) -> Result<egui_mcp_protocol::messages::ScreenshotResponse> {
     unsafe {
         let hdc_screen = GetDC(HWND(std::ptr::null_mut()));
+        if hdc_screen.0.is_null() {
+            return Err(anyhow!("Failed to acquire screen device context"));
+        }
+
         let hdc_mem = CreateCompatibleDC(hdc_screen);
+        if hdc_mem.0.is_null() {
+            ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            return Err(anyhow!("Failed to create compatible device context"));
+        }
 
         let rect = if let Some(region) = region {
             RECT {
@@ -34,91 +43,97 @@ pub fn capture_screen(
 
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            return Err(anyhow!(
+                "Screenshot bounds must have positive width and height"
+            ));
+        }
 
-        let hbitmap = CreateCompatibleBitmap(hdc_screen, width, height);
-        SelectObject(hdc_mem, hbitmap);
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // Top-down DIB for direct row order
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD::default(); 1],
+        };
 
-        let _ = BitBlt(
+        let mut dib_bits: *mut c_void = std::ptr::null_mut();
+        let hbitmap = CreateDIBSection(
+            hdc_screen,
+            &bmi,
+            DIB_RGB_COLORS,
+            std::ptr::addr_of_mut!(dib_bits),
+            None,
+            0,
+        )
+        .map_err(|err| anyhow!("CreateDIBSection failed: {}", err))?;
+
+        if hbitmap.0.is_null() || dib_bits.is_null() {
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            return Err(anyhow!("Failed to create DIB section for screenshot capture"));
+        }
+
+        let previous_obj = SelectObject(hdc_mem, hbitmap);
+        if previous_obj.0.is_null() {
+            let _ = DeleteObject(hbitmap);
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            return Err(anyhow!("Failed to select DIB section into memory device context"));
+        }
+
+        BitBlt(
             hdc_mem, 0, 0, width, height, hdc_screen, rect.left, rect.top, SRCCOPY,
-        );
+        )
+        .map_err(|err| anyhow!("BitBlt failed while capturing screenshot: {}", err))
+        .inspect_err(|_| {
+            let _ = SelectObject(hdc_mem, previous_obj);
+            let _ = DeleteObject(hbitmap);
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+        })?;
 
         let mut image = ImageBuffer::new(width as u32, height as u32);
-        get_bitmap_data(hbitmap, &mut image)?;
+        let raw_len = (width as usize) * (height as usize) * 4;
+        let raw_bgra = std::slice::from_raw_parts(dib_bits as *const u8, raw_len);
 
+        for y in 0..(height as usize) {
+            let row_offset = y * (width as usize) * 4;
+            for x in 0..(width as usize) {
+                let offset = row_offset + x * 4;
+                let b = raw_bgra[offset];
+                let g = raw_bgra[offset + 1];
+                let r = raw_bgra[offset + 2];
+                let a = raw_bgra[offset + 3];
+                image.put_pixel(x as u32, y as u32, Rgba([r, g, b, a]));
+            }
+        }
+
+        let _ = SelectObject(hdc_mem, previous_obj);
         let _ = DeleteObject(hbitmap);
         let _ = DeleteDC(hdc_mem);
         ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
 
-        // Convert to RGB bytes
-        let mut rgb_data = Vec::with_capacity(width as usize * height as usize * 3);
-        for pixel in image.pixels() {
-            rgb_data.push(pixel[0]); // Red
-            rgb_data.push(pixel[1]); // Green
-            rgb_data.push(pixel[2]); // Blue
-        }
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .map_err(|err| anyhow!("Failed to encode screenshot PNG: {}", err))?;
 
         Ok(egui_mcp_protocol::messages::ScreenshotResponse {
-            image_data: rgb_data,
+            image_data: cursor.into_inner(),
             width: width as u32,
             height: height as u32,
         })
     }
-}
-
-unsafe fn get_bitmap_data(
-    hbitmap: HBITMAP,
-    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-) -> Result<()> {
-    let mut bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: image.width() as i32,
-            biHeight: -(image.height() as i32), // Top-down
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0, // BI_RGB is 0
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
-        },
-        bmiColors: [RGBQUAD::default(); 1],
-    };
-
-    let mut bits: *mut u8 = std::ptr::null_mut();
-    GetDIBits(
-        GetDC(HWND(std::ptr::null_mut())),
-        hbitmap,
-        0,
-        image.height() as u32,
-        Some(std::ptr::addr_of_mut!(bits) as *mut c_void),
-        &mut bmi,
-        DIB_RGB_COLORS,
-    );
-
-    if bits.is_null() {
-        return Err(anyhow::anyhow!("Failed to get bitmap bits"));
-    }
-
-    let bytes_per_pixel = 4;
-    let stride = image.width() as i32 * bytes_per_pixel;
-
-    for y in 0..image.height() {
-        let row_ptr = bits.offset(y as isize * stride as isize);
-        for x in 0..image.width() {
-            let pixel_ptr = row_ptr.offset(x as isize * bytes_per_pixel as isize);
-            let bgra_ptr = pixel_ptr as *const [u8; 4];
-            let bgra = bgra_ptr.read_unaligned();
-            let rgba = Rgba([
-                bgra[2], // Red
-                bgra[1], // Green
-                bgra[0], // Blue
-                bgra[3], // Alpha
-            ]);
-            image.put_pixel(x, y, rgba);
-        }
-    }
-
-    Ok(())
 }

@@ -21,6 +21,7 @@ tracing-subscriber = "0.3"
 
 # Base64 encoding
 base64 = "0.22"
+image = "0.25"
 
 # Clipboard access
 clipboard-win = "5.4"
@@ -28,6 +29,7 @@ clipboard-win = "5.4"
 # Windows UI Automation
 windows = { version = "0.58", features = [
     "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_Foundation",
@@ -39,3 +41,6 @@ windows = { version = "0.58", features = [
 # Protocol definitions (local workspace)
 egui-mcp-protocol = { path = "../egui-mcp-protocol" }
 egui-mcp-client-win = { path = "../egui-mcp-client-win" }
+
+[dev-dependencies]
+egui_kittest = "0.32.3"
