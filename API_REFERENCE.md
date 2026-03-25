@@ -6,7 +6,7 @@ This document provides a complete reference for all MCP tools available in the W
 
 **Total Tools**: 21+ tools across multiple categories
 
-**Availability note**: This file is API shape/reference. For current implementation and remaining work, see `ROADMAP_REMAINING.md`.
+**Availability note**: This file is API shape/reference. For current implementation details, see `README.md`.
 
 ---
 
