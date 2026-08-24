@@ -144,6 +144,43 @@ impl ServerHarness {
             method, id
         ))
     }
+
+    /// Sends a JSON-RPC notification, which carries no `id` and must not be
+    /// answered.
+    fn send_notification(&mut self, method: &str, params: Option<Value>) {
+        let mut payload = json!({
+            "jsonrpc": "2.0",
+            "method": method
+        });
+        if let Some(params) = params {
+            payload["params"] = params;
+        }
+
+        let line = serde_json::to_string(&payload).expect("failed to serialize notification");
+        writeln!(self.stdin, "{line}")
+            .and_then(|_| self.stdin.flush())
+            .expect("failed to write notification");
+    }
+
+    /// True when no target app is reachable, meaning a blind sweep across every
+    /// tool cannot drive real mouse or keyboard input.
+    fn is_isolated(&mut self) -> bool {
+        let response = self
+            .send_request(8_100, "check_connection", None)
+            .expect("check_connection failed");
+        let result = response.get("result").expect("check_connection missing result");
+
+        let ipc = result
+            .get("ipc_connected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let window = result
+            .get("uia_window_available")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        !ipc && !window
+    }
 }
 
 impl Drop for ServerHarness {
@@ -993,4 +1030,409 @@ Set {}=1 to override.",
         .expect("wait_for_value_change request failed");
     assert_error_code(&timeout_response, -32000);
     assert_error_message_contains(&timeout_response, "did not change");
+}
+
+// --- MCP protocol conformance -------------------------------------------------
+
+#[test]
+fn initialize_returns_protocol_version_and_server_info() {
+    let mut server = ServerHarness::spawn();
+
+    let response = server
+        .send_request(
+            700,
+            "initialize",
+            Some(json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "integration-test", "version": "0.0.0" }
+            })),
+        )
+        .expect("initialize failed");
+
+    assert!(
+        response.get("error").is_none(),
+        "initialize returned an error: {response}"
+    );
+    let result = response.get("result").expect("initialize missing result");
+
+    assert_eq!(
+        result.get("protocolVersion").and_then(Value::as_str),
+        Some("2024-11-05"),
+        "server should echo a protocol version it supports"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|caps| caps.get("tools"))
+            .is_some(),
+        "server must advertise the tools capability"
+    );
+    assert_eq!(
+        result
+            .get("serverInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str),
+        Some("egui-mcp-server-win")
+    );
+    assert!(
+        result
+            .get("serverInfo")
+            .and_then(|info| info.get("version"))
+            .and_then(Value::as_str)
+            .is_some_and(|version| !version.is_empty()),
+        "serverInfo.version must be populated"
+    );
+}
+
+#[test]
+fn initialize_falls_back_for_unknown_protocol_version() {
+    let mut server = ServerHarness::spawn();
+
+    let response = server
+        .send_request(
+            701,
+            "initialize",
+            Some(json!({"protocolVersion": "1999-01-01"})),
+        )
+        .expect("initialize failed");
+
+    assert_eq!(
+        response["result"]["protocolVersion"].as_str(),
+        Some("2024-11-05"),
+        "unknown versions should degrade to the server default rather than fail"
+    );
+}
+
+#[test]
+fn notifications_are_not_answered_and_do_not_kill_the_server() {
+    let mut server = ServerHarness::spawn();
+
+    server.send_notification("notifications/initialized", None);
+    server.send_notification("notifications/cancelled", Some(json!({"requestId": 1})));
+
+    // The server must still answer normal requests afterwards.
+    let response = server
+        .send_request(702, "ping", None)
+        .expect("server stopped responding after receiving notifications");
+    assert_eq!(response["result"]["status"].as_str(), Some("pong"));
+}
+
+#[test]
+fn tools_list_advertises_tools_with_object_schemas() {
+    let mut server = ServerHarness::spawn();
+
+    let response = server
+        .send_request(703, "tools/list", None)
+        .expect("tools/list failed");
+    assert!(
+        response.get("error").is_none(),
+        "tools/list returned an error: {response}"
+    );
+
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list must return an array of tools");
+    assert!(
+        tools.len() >= 50,
+        "expected the full tool surface, got {}",
+        tools.len()
+    );
+
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool missing name");
+        assert!(
+            tool["description"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "tool '{name}' has no description"
+        );
+        assert_eq!(
+            tool["inputSchema"]["type"].as_str(),
+            Some("object"),
+            "tool '{name}' must declare an object schema"
+        );
+    }
+
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for expected in [
+        "ping",
+        "get_ui_tree",
+        "find_by_label",
+        "click_at",
+        "take_screenshot",
+        "set_target_window",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "tools/list is missing '{expected}'"
+        );
+    }
+}
+
+#[test]
+fn tools_call_wraps_results_in_content_blocks() {
+    let mut server = ServerHarness::spawn();
+
+    let response = server
+        .send_request(704, "tools/call", Some(json!({"name": "ping"})))
+        .expect("tools/call failed");
+    assert!(
+        response.get("error").is_none(),
+        "tools/call returned an error: {response}"
+    );
+
+    let result = &response["result"];
+    assert_eq!(result["isError"].as_bool(), Some(false));
+
+    let content = result["content"]
+        .as_array()
+        .expect("tools/call result must carry content blocks");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"].as_str(), Some("text"));
+    assert!(
+        content[0]["text"].as_str().unwrap().contains("pong"),
+        "content should carry the tool's JSON result"
+    );
+}
+
+#[test]
+fn tools_call_rejects_unknown_tool_with_method_not_found() {
+    let mut server = ServerHarness::spawn();
+
+    let response = server
+        .send_request(705, "tools/call", Some(json!({"name": "no_such_tool"})))
+        .expect("tools/call failed");
+
+    assert_error_code(&response, -32601);
+}
+
+#[test]
+fn tools_call_requires_a_tool_name() {
+    let mut server = ServerHarness::spawn();
+
+    let missing = server
+        .send_request(706, "tools/call", Some(json!({})))
+        .expect("tools/call failed");
+    assert_error_code(&missing, -32602);
+
+    let bad_arguments = server
+        .send_request(
+            707,
+            "tools/call",
+            Some(json!({"name": "ping", "arguments": "not-an-object"})),
+        )
+        .expect("tools/call failed");
+    assert_error_code(&bad_arguments, -32602);
+}
+
+#[test]
+fn tools_call_surfaces_tool_failures_as_is_error() {
+    let mut server = ServerHarness::spawn();
+
+    // Missing the required `label` argument fails inside the tool, which MCP
+    // reports as a successful call carrying isError rather than a JSON-RPC error.
+    let response = server
+        .send_request(
+            708,
+            "tools/call",
+            Some(json!({"name": "find_by_label", "arguments": {}})),
+        )
+        .expect("tools/call failed");
+
+    assert!(
+        response.get("error").is_none(),
+        "tool-level failures belong in the result, not a JSON-RPC error: {response}"
+    );
+    assert_eq!(response["result"]["isError"].as_bool(), Some(true));
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("label"),
+        "error content should name the missing parameter"
+    );
+}
+
+#[test]
+fn every_advertised_tool_is_dispatchable() {
+    let mut server = ServerHarness::spawn();
+
+    // A blind sweep would drive real input if an app were attached, so only run
+    // it when nothing is reachable.
+    if !server.is_isolated() {
+        eprintln!("Skipping tool sweep because a live target app is reachable.");
+        return;
+    }
+
+    let listed = server
+        .send_request(709, "tools/list", None)
+        .expect("tools/list failed");
+    let names: Vec<String> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools/list must return an array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(!names.is_empty(), "tools/list returned nothing");
+
+    for (offset, name) in names.into_iter().enumerate() {
+        let response = server
+            .send_request(
+                7_100 + offset as i64,
+                "tools/call",
+                Some(json!({"name": name, "arguments": {}})),
+            )
+            .unwrap_or_else(|err| panic!("tools/call for '{name}' failed: {err}"));
+
+        let code = response
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64);
+        assert_ne!(
+            code,
+            Some(-32601),
+            "tool '{name}' is advertised by tools/list but is not dispatchable"
+        );
+    }
+}
+
+// --- Target window configuration ---------------------------------------------
+
+#[test]
+fn target_window_is_reported_and_configurable() {
+    let mut server = ServerHarness::spawn();
+
+    let initial = server
+        .send_request(720, "get_target_window", None)
+        .expect("get_target_window failed");
+    let original = initial["result"]["target_window"]
+        .as_str()
+        .expect("get_target_window must report a title")
+        .to_string();
+    assert!(!original.is_empty(), "target window must not be empty");
+
+    let updated = server
+        .send_request(
+            721,
+            "set_target_window",
+            Some(json!({"title": "Some Other Window"})),
+        )
+        .expect("set_target_window failed");
+    assert!(
+        updated.get("error").is_none(),
+        "set_target_window returned an error: {updated}"
+    );
+    assert_eq!(
+        updated["result"]["target_window"].as_str(),
+        Some("Some Other Window")
+    );
+    assert_eq!(
+        updated["result"]["previous_target_window"].as_str(),
+        Some(original.as_str())
+    );
+
+    // The change must stick and be visible to check_connection.
+    let after = server
+        .send_request(722, "check_connection", None)
+        .expect("check_connection failed");
+    assert_eq!(
+        after["result"]["target_window"].as_str(),
+        Some("Some Other Window")
+    );
+}
+
+#[test]
+fn set_target_window_rejects_empty_titles() {
+    let mut server = ServerHarness::spawn();
+
+    for bad in [json!({}), json!({"title": ""}), json!({"title": "   "})] {
+        let response = server
+            .send_request(723, "set_target_window", Some(bad.clone()))
+            .expect("set_target_window request failed");
+        assert_error_code(&response, -32602);
+    }
+}
+
+// --- Transport hygiene --------------------------------------------------------
+
+#[test]
+fn stdout_carries_only_json_lines() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_egui-mcp-server-win"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn server");
+
+    let mut stdin = child.stdin.take().expect("missing stdin");
+    let stdout = child.stdout.take().expect("missing stdout");
+    let stderr = child.stderr.take().expect("missing stderr");
+    let _drain = spawn_stderr_drain(stderr);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    )
+    .and_then(|_| stdin.flush())
+    .expect("failed to write ping");
+
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("failed to read stdout");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let trimmed = line.trim();
+    assert!(
+        !trimmed.is_empty(),
+        "server produced no stdout before responding"
+    );
+    serde_json::from_str::<Value>(trimmed).unwrap_or_else(|err| {
+        panic!("stdout must carry only JSON-RPC lines, got {trimmed:?}: {err}")
+    });
+}
+
+#[test]
+fn check_connection_reports_disconnected_when_ipc_server_absent() {
+    let mut server = ServerHarness::spawn();
+    let response = server
+        .send_request(801, "check_connection", None)
+        .expect("check_connection request failed");
+
+    assert_eq!(response["result"]["ipc_connected"], false);
+    assert_eq!(response["result"]["status"], "partial");
+}
+
+#[test]
+fn input_tools_return_clean_errors_when_ipc_server_absent() {
+    let mut server = ServerHarness::spawn();
+
+    let right_click_response = server
+        .send_request(
+            802,
+            "tools/call",
+            Some(json!({
+                "name": "right_click_at",
+                "arguments": {"x": 100, "y": 100}
+            })),
+        )
+        .expect("right_click_at call failed");
+
+    assert_eq!(right_click_response["result"]["isError"], true);
+
+    let drag_response = server
+        .send_request(
+            803,
+            "tools/call",
+            Some(json!({
+                "name": "drag",
+                "arguments": {"x1": 100, "y1": 100, "x2": 200, "y2": 200}
+            })),
+        )
+        .expect("drag call failed");
+
+    assert_eq!(drag_response["result"]["isError"], true);
 }
