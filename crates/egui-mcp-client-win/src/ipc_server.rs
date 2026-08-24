@@ -23,23 +23,62 @@ impl IpcServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        info!("Waiting for connection to named pipe...");
+        // Serve connections one after another for the life of the process.
+        // A client disconnecting is a normal event, not a fatal one — reset
+        // the pipe instance and wait for the next connection.
+        loop {
+            info!("Waiting for connection to named pipe...");
+            self.pipe.connect().await?;
+            info!("Connected to client");
 
-        // Wait for a client to connect
-        self.pipe.connect().await?;
+            if let Err(e) = Self::handle_connection(&mut self.pipe).await {
+                error!("IPC connection ended with an error: {}", e);
+            }
 
-        info!("Connected to client");
-
-        // Handle communication with the client
-        Self::handle_connection(&mut self.pipe).await?;
-
-        Ok(())
+            self.pipe.disconnect()?;
+        }
     }
-
     async fn handle_connection(pipe: &mut NamedPipeServer) -> Result<()> {
         let mut buffer = Vec::new();
 
         loop {
+            // Drain and answer every complete message already buffered
+            // before reading more — a single read() can return more than
+            // one pipelined message, and only handling the first would
+            // silently drop the rest.
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let message_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                let mut line = &message_bytes[..message_bytes.len() - 1]; // trim \n
+                if line.ends_with(b"\r") {
+                    line = &line[..line.len() - 1]; // trim \r
+                }
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                let response = match serde_json::from_slice::<IpcMessage>(line) {
+                    Ok(message) => match Self::process_message(message).await {
+                        Ok(resp) => resp,
+                        Err(e) => IpcMessage::Error(egui_mcp_protocol::messages::ErrorMessage {
+                            message: "Internal server error processing IPC message".to_string(),
+                            details: Some(e.to_string()),
+                        }),
+                    },
+                    Err(e) => {
+                        error!("Failed to parse message: {}", e);
+                        IpcMessage::Error(egui_mcp_protocol::messages::ErrorMessage {
+                            message: format!("Failed to parse IPC message: {}", e),
+                            details: None,
+                        })
+                    }
+                };
+
+                let response_bytes = serde_json::to_vec(&response)?;
+                pipe.write_all(&response_bytes).await?;
+                pipe.write_all(b"\n").await?; // Delimiter
+            }
+
             let mut chunk = [0; 4096];
             let n = pipe.read(&mut chunk).await?;
 
@@ -49,42 +88,9 @@ impl IpcServer {
             }
 
             buffer.extend_from_slice(&chunk[..n]);
-
-            // Try to parse the message
-            match Self::parse_message(&buffer) {
-                Ok(Some(message)) => {
-                    // Process the message
-                    let response = Self::process_message(message).await?;
-
-                    // Send the response
-                    let response_bytes = serde_json::to_vec(&response)?;
-                    pipe.write_all(&response_bytes).await?;
-                    pipe.write_all(b"\n").await?; // Delimiter
-
-                    buffer.clear();
-                }
-                Ok(None) => {
-                    // Incomplete message, continue reading
-                }
-                Err(e) => {
-                    error!("Failed to parse message: {}", e);
-                    buffer.clear();
-                }
-            }
         }
 
         Ok(())
-    }
-
-    fn parse_message(buffer: &[u8]) -> Result<Option<IpcMessage>> {
-        // Look for newline delimiter
-        if let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-            let message_bytes = &buffer[..pos];
-            let message = serde_json::from_slice::<IpcMessage>(message_bytes)?;
-            Ok(Some(message))
-        } else {
-            Ok(None)
-        }
     }
 
     async fn process_message(message: IpcMessage) -> Result<IpcMessage> {
@@ -160,6 +166,22 @@ impl IpcServer {
                     )),
                 }
             }
+            IpcMessage::DragRequest(req) => {
+                // Handle drag: a press-move-release gesture performed as one unit,
+                // so the button stays down for every intermediate move.
+                match Self::perform_drag(&req).await {
+                    Ok(_) => Ok(IpcMessage::DragResponse(
+                        egui_mcp_protocol::messages::DragResponse { success: true },
+                    )),
+                    Err(e) => Ok(IpcMessage::Error(
+                        egui_mcp_protocol::messages::ErrorMessage {
+                            message: "Failed to drag".to_string(),
+                            details: Some(e.to_string()),
+                        },
+                    )),
+                }
+            }
+
             _ => Ok(IpcMessage::Error(
                 egui_mcp_protocol::messages::ErrorMessage {
                     message: "Unsupported message type".to_string(),
@@ -167,5 +189,33 @@ impl IpcServer {
                 },
             )),
         }
+    }
+
+    /// Performs a drag as a single press-move-release gesture, keeping the
+    /// button held down through every intermediate move so the target
+    /// application sees a continuous drag rather than a move plus a click.
+    async fn perform_drag(req: &egui_mcp_protocol::messages::DragRequest) -> Result<()> {
+        crate::input::send_mouse_move(req.x1, req.y1)?;
+        crate::input::send_mouse_button(req.button, true)?;
+
+        let result = async {
+            let steps = req.steps.max(1);
+            for step in 1..=steps {
+                let t = step as f64 / steps as f64;
+                let x = req.x1 + ((req.x2 - req.x1) as f64 * t).round() as i32;
+                let y = req.y1 + ((req.y2 - req.y1) as f64 * t).round() as i32;
+                crate::input::send_mouse_move(x, y)?;
+
+                if req.step_delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(req.step_delay_ms)).await;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        // Always release the mouse button even if intermediate steps fail.
+        let _ = crate::input::send_mouse_button(req.button, false);
+        result
     }
 }

@@ -119,7 +119,10 @@ fn main() {
   "mcpServers": {
     "egui": {
       "command": "C:\\path\\to\\egui-mcp-server-win.exe",
-      "args": []
+      "args": [],
+      "env": {
+        "EGUI_MCP_WINDOW_TITLE": "My App"
+      }
     }
   }
 }
@@ -128,6 +131,22 @@ fn main() {
 **3.** Launch your egui app, connect your MCP client, and start automating.
 
 For full parameter schemas and JSON-RPC examples, see [`API_REFERENCE.md`](./API_REFERENCE.md).
+
+---
+
+## Targeting Your Window
+
+Every UI Automation tool acts on one target window, matched by title
+(case-insensitive, partial matches allowed). Set it in any of three ways:
+
+| Method | When to use |
+|---|---|
+| `EGUI_MCP_WINDOW_TITLE` env var | Normal setup — set it in your MCP client config, as above. |
+| `set_target_window` tool | Switch windows mid-session, or let the agent pick one. |
+| Neither | Falls back to `egui-mcp Demo`. |
+
+Call `get_window_list` to see every title UIA can currently see, and
+`get_target_window` or `check_connection` to confirm what the server is aimed at.
 
 ---
 

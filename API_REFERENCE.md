@@ -4,9 +4,18 @@
 
 This document provides a complete reference for all MCP tools available in the Windows port of egui-mcp.
 
-**Total Tools**: 21+ tools across multiple categories
+**Total Tools**: 60 tools across multiple categories
 
 **Availability note**: This file is API shape/reference. For current implementation details, see `README.md`.
+
+**Discovery**: The server implements the MCP lifecycle (`initialize`, `tools/list`,
+`tools/call`), so any MCP client gets these tools and their JSON Schemas
+automatically — `tools/list` is the authoritative, always-current version of the
+tables below. The bare JSON-RPC method names documented here remain callable
+directly, which is what the examples in this file show.
+
+**Target window**: UI Automation tools act on the window named by
+`EGUI_MCP_WINDOW_TITLE`, or by the `set_target_window` tool. See the README.
 
 ---
 
@@ -638,9 +647,49 @@ Check IPC and UIA connection status.
   "ipc_connected": true,
   "uia_connected": true,
   "uia_window_available": true,
+  "target_window": "egui-mcp Demo",
   "status": "fully_connected"  // or "partial"
 }
 ```
+
+---
+
+### `get_target_window`
+Report the window title every UI Automation tool currently acts on.
+
+**Parameters**: None
+
+**Returns**:
+```json
+{
+  "target_window": "My App",
+  "source_env_var": "EGUI_MCP_WINDOW_TITLE",
+  "default": "egui-mcp Demo"
+}
+```
+
+---
+
+### `set_target_window`
+Point the server at a different window. Matching is case-insensitive and accepts
+partial titles. Use `get_window_list` to discover available titles.
+
+**Parameters**:
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `title` | string | ✅ | Window title to target, full or partial. |
+
+**Returns**:
+```json
+{
+  "success": true,
+  "target_window": "My App",
+  "previous_target_window": "egui-mcp Demo",
+  "uia_window_available": true
+}
+```
+
+**Errors**: `-32602` if `title` is missing, empty, or not a string.
 
 ---
 

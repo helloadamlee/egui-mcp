@@ -33,6 +33,12 @@ pub enum IpcMessage {
     #[serde(rename = "scroll_response")]
     ScrollResponse(ScrollResponse),
 
+    #[serde(rename = "drag_request")]
+    DragRequest(DragRequest),
+
+    #[serde(rename = "drag_response")]
+    DragResponse(DragResponse),
+
     #[serde(rename = "ping")]
     Ping,
 
@@ -98,6 +104,47 @@ pub struct ScrollRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScrollResponse {
+    pub success: bool,
+}
+
+/// A press-move-release gesture performed as one unit by the client.
+///
+/// The whole gesture has to happen on the app side: sending a bare move, then a
+/// separate press, lets other input interleave and drops the button state that
+/// makes a drag a drag.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DragRequest {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
+    pub button: MouseButton,
+    /// Intermediate move events between press and release. Applications that
+    /// track motion need several; one long jump often reads as a click.
+    pub steps: u32,
+    /// Pause between successive move events, in milliseconds.
+    pub step_delay_ms: u64,
+}
+
+impl DragRequest {
+    pub const DEFAULT_STEPS: u32 = 12;
+    pub const DEFAULT_STEP_DELAY_MS: u64 = 12;
+
+    pub fn new(x1: i32, y1: i32, x2: i32, y2: i32) -> Self {
+        Self {
+            x1,
+            y1,
+            x2,
+            y2,
+            button: MouseButton::Left,
+            steps: Self::DEFAULT_STEPS,
+            step_delay_ms: Self::DEFAULT_STEP_DELAY_MS,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DragResponse {
     pub success: bool,
 }
 

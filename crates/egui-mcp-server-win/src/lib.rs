@@ -5,9 +5,9 @@ use tracing::{error, info, warn};
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 mod ipc;
+mod mcp;
 mod screenshot_core;
 mod snapshot_store;
-mod tools;
 mod uia_client;
 
 pub use ipc::IpcClient;
@@ -17,7 +17,35 @@ use screenshot_core::{
 use snapshot_store::SnapshotStore;
 pub use uia_client::{ElementInfo, Rect as UiaRect, UiaClient};
 
-const WINDOW_TITLE: &str = "egui-mcp Demo";
+/// Fallback target window title, used when `EGUI_MCP_WINDOW_TITLE` is unset.
+pub const DEFAULT_WINDOW_TITLE: &str = "egui-mcp Demo";
+
+/// Environment variable that overrides the target window title at startup.
+pub const WINDOW_TITLE_ENV: &str = "EGUI_MCP_WINDOW_TITLE";
+
+const SERVER_NAME: &str = "egui-mcp-server-win";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Protocol version advertised when a client does not request a known one.
+const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Protocol revisions this server is compatible with. A client requesting any
+/// of these gets its own version echoed back; anything else is answered with
+/// `DEFAULT_PROTOCOL_VERSION` so negotiation degrades instead of failing.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// Result captured from a handler while serving a `tools/call` request.
+type CapturedOutcome = std::result::Result<Value, (i32, String)>;
+
+/// Resolves the target window title from the environment, falling back to
+/// [`DEFAULT_WINDOW_TITLE`].
+pub fn default_target_window() -> String {
+    std::env::var(WINDOW_TITLE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_WINDOW_TITLE.to_string())
+}
 
 fn required_non_empty_string_param<'a>(
     params: &'a Value,
@@ -106,10 +134,18 @@ pub struct McpServer<R: BufRead, W: Write> {
     ipc_client: Option<IpcClient>,
     uia_client: Option<UiaClient>,
     snapshot_store: Option<SnapshotStore>,
+    target_window: String,
+    /// `Some` while a `tools/call` is in flight, so handler output is captured
+    /// into the inner slot instead of being written straight to the transport.
+    capture: Option<Option<CapturedOutcome>>,
 }
 
 impl<R: BufRead, W: Write> McpServer<R, W> {
     pub fn new(reader: R, writer: W) -> Self {
+        Self::with_target_window(reader, writer, default_target_window())
+    }
+
+    pub fn with_target_window(reader: R, writer: W, target_window: impl Into<String>) -> Self {
         let snapshot_store = match SnapshotStore::new() {
             Ok(store) => Some(store),
             Err(err) => {
@@ -127,7 +163,13 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             ipc_client: None,
             uia_client: None,
             snapshot_store,
+            target_window: target_window.into(),
+            capture: None,
         }
+    }
+
+    pub fn target_window(&self) -> &str {
+        &self.target_window
     }
 
     pub async fn connect(&mut self) -> Result<()> {
@@ -150,17 +192,17 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         info!("Initializing UI Automation client...");
         match UiaClient::new().await {
             Ok(client) => {
-                match client.find_window_by_title(WINDOW_TITLE).await {
+                match client.find_window_by_title(&self.target_window).await {
                     Ok(_) => {
                         info!(
                             "UI Automation connected to target window '{}'",
-                            WINDOW_TITLE
+                            &self.target_window
                         );
                     }
                     Err(err) => {
                         info!(
                             "UI Automation initialized, but target window '{}' is not available yet: {}",
-                            WINDOW_TITLE, err
+                            &self.target_window, err
                         );
                     }
                 }
@@ -177,20 +219,68 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
 
         Ok(())
     }
+    /// Ensures `self.ipc_client` is connected before an IPC-backed handler
+    /// uses it, reconnecting if it is missing (initial connect never
+    /// succeeded) or has been marked dead by a prior I/O failure. Called as
+    /// its own statement, before any handler borrows `self.ipc_client`, so
+    /// it never holds a borrow across the reconnect attempt.
+    async fn ensure_ipc_connected(&mut self) {
+        let needs_reconnect = match &self.ipc_client {
+            Some(client) => !client.is_connected(),
+            None => true,
+        };
 
-    pub fn read_message(&mut self) -> Result<Option<Value>> {
-        let mut buffer = String::new();
-        let bytes_read = self.reader.read_line(&mut buffer)?;
-
-        if bytes_read == 0 || buffer.trim().is_empty() {
-            return Ok(None);
+        if needs_reconnect {
+            match IpcClient::connect_fast().await {
+                Ok(client) => {
+                    info!("(Re)connected to egui app via IPC");
+                    self.ipc_client = Some(client);
+                }
+                Err(e) => {
+                    warn!("IPC reconnect failed: {}. IPC tools won't work.", e);
+                    self.ipc_client = None;
+                }
+            }
         }
+    }
 
-        let message: Value = serde_json::from_str(&buffer.trim())?;
+
+
+    /// Reads the next non-blank line from the transport.
+    ///
+    /// `Ok(None)` means the peer closed the stream, which is the signal to shut
+    /// down rather than keep polling a dead pipe.
+    pub fn read_line_raw(&mut self) -> Result<Option<String>> {
+        loop {
+            let mut buffer = String::new();
+            let bytes_read = self.reader.read_line(&mut buffer)?;
+
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+
+            if !buffer.trim().is_empty() {
+                return Ok(Some(buffer));
+            }
+        }
+    }
+
+    /// Reads and parses the next message. `Ok(None)` signals end of stream.
+    pub fn read_message(&mut self) -> Result<Option<Value>> {
+        let Some(line) = self.read_line_raw()? else {
+            return Ok(None);
+        };
+
+        let message: Value = serde_json::from_str(line.trim())?;
         Ok(Some(message))
     }
 
     pub fn write_response(&mut self, id: i64, result: Value) -> Result<()> {
+        if let Some(slot) = self.capture.as_mut() {
+            *slot = Some(Ok(result));
+            return Ok(());
+        }
+
         let response = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -202,6 +292,11 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
     }
 
     pub fn write_error(&mut self, id: i64, code: i32, message: String) -> Result<()> {
+        if let Some(slot) = self.capture.as_mut() {
+            *slot = Some(Err((code, message)));
+            return Ok(());
+        }
+
         let response = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -216,14 +311,110 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
     }
 
     pub async fn handle_message(&mut self, message: &Value) -> Result<()> {
-        let id = message.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let default_params = json!({});
         let params = message.get("params").unwrap_or(&default_params);
 
+        // Notifications carry no `id` and must never be answered.
+        let Some(id) = message.get("id").and_then(|v| v.as_i64()) else {
+            info!("Received notification: {}", method);
+            return Ok(());
+        };
+
+        match method {
+            "initialize" => self.handle_initialize(id, params).await,
+            "tools/list" => self.handle_tools_list(id).await,
+            "tools/call" => self.handle_tools_call(id, params).await,
+            // Bare method names stay dispatchable so existing JSON-RPC callers
+            // and the integration tests keep working alongside MCP clients.
+            _ => self.dispatch_tool(id, method, params).await,
+        }
+    }
+
+    /// Answers the MCP `initialize` handshake.
+    async fn handle_initialize(&mut self, id: i64, params: &Value) -> Result<()> {
+        let requested = params.get("protocolVersion").and_then(|v| v.as_str());
+        let protocol_version = match requested {
+            Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
+            _ => DEFAULT_PROTOCOL_VERSION,
+        };
+
+        self.write_response(
+            id,
+            json!({
+                "protocolVersion": protocol_version,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+            }),
+        )
+    }
+
+    /// Advertises every callable tool with its JSON Schema.
+    async fn handle_tools_list(&mut self, id: i64) -> Result<()> {
+        self.write_response(id, json!({ "tools": mcp::tool_definitions() }))
+    }
+
+    /// Runs one tool on behalf of an MCP client and wraps its output in the
+    /// `content` envelope the protocol expects.
+    async fn handle_tools_call(&mut self, id: i64, params: &Value) -> Result<()> {
+        let name = match required_non_empty_string_param(params, "name") {
+            Ok(value) => value.to_string(),
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+
+        if matches!(
+            name.as_str(),
+            "initialize" | "tools/list" | "tools/call" | "notifications/initialized"
+        ) {
+            return self.write_error(id, -32602, format!("'{}' is not a callable tool", name));
+        }
+
+        let arguments = match params.get("arguments") {
+            None | Some(Value::Null) => json!({}),
+            Some(value) if value.is_object() => value.clone(),
+            Some(_) => {
+                return self.write_error(
+                    id,
+                    -32602,
+                    "Parameter 'arguments' must be an object".to_string(),
+                )
+            }
+        };
+
+        self.capture = Some(None);
+        let dispatch = self.dispatch_tool(id, &name, &arguments).await;
+        let captured = self.capture.take().flatten();
+        dispatch?;
+
+        match captured {
+            Some(Ok(result)) => {
+                let content = mcp::result_to_content(&result);
+                self.write_response(id, json!({ "content": content, "isError": false }))
+            }
+            // An unknown tool is a protocol fault, not a tool failure.
+            Some(Err((-32601, message))) => self.write_error(id, -32601, message),
+            Some(Err((code, message))) => self.write_response(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": message }],
+                    "isError": true,
+                    "_meta": { "code": code }
+                }),
+            ),
+            None => self.write_error(
+                id,
+                -32603,
+                format!("Tool '{}' produced no response", name),
+            ),
+        }
+    }
+
+    async fn dispatch_tool(&mut self, id: i64, method: &str, params: &Value) -> Result<()> {
         match method {
             "ping" => self.handle_ping(id).await,
             "check_connection" => self.handle_check_connection(id).await,
+            "get_target_window" => self.handle_get_target_window(id).await,
+            "set_target_window" => self.handle_set_target_window(id, params).await,
 
             // UI Tree Tools
             "get_ui_tree" => self.handle_get_ui_tree(id).await,
@@ -311,10 +502,10 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
 
     // Handler: check_connection
     async fn handle_check_connection(&mut self, id: i64) -> Result<()> {
-        let ipc_connected = self.ipc_client.is_some();
+        let ipc_connected = self.ipc_client.as_ref().map_or(false, |c| c.is_connected());
         let uia_connected = self.uia_client.is_some();
         let uia_window_available = if let Some(uia) = &self.uia_client {
-            uia.find_window_by_title(WINDOW_TITLE).await.is_ok()
+            uia.find_window_by_title(&self.target_window).await.is_ok()
         } else {
             false
         };
@@ -323,14 +514,57 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             "ipc_connected": ipc_connected,
             "uia_connected": uia_connected,
             "uia_window_available": uia_window_available,
+            "target_window": self.target_window,
             "status": if ipc_connected && uia_window_available { "fully_connected" } else { "partial" }
         }))
+    }
+
+    // Handler: get_target_window
+    async fn handle_get_target_window(&mut self, id: i64) -> Result<()> {
+        self.write_response(
+            id,
+            json!({
+                "target_window": self.target_window,
+                "source_env_var": WINDOW_TITLE_ENV,
+                "default": DEFAULT_WINDOW_TITLE
+            }),
+        )
+    }
+
+    // Handler: set_target_window
+    async fn handle_set_target_window(&mut self, id: i64, params: &Value) -> Result<()> {
+        let title = match required_non_empty_string_param_any(params, &["title", "window_title"]) {
+            Ok(value) => value.to_string(),
+            Err(message) => return self.write_error(id, -32602, message),
+        };
+
+        let previous = std::mem::replace(&mut self.target_window, title);
+        let available = if let Some(uia) = &self.uia_client {
+            uia.find_window_by_title(&self.target_window).await.is_ok()
+        } else {
+            false
+        };
+
+        info!(
+            "Target window changed from '{}' to '{}'",
+            previous, self.target_window
+        );
+
+        self.write_response(
+            id,
+            json!({
+                "success": true,
+                "target_window": self.target_window,
+                "previous_target_window": previous,
+                "uia_window_available": available
+            }),
+        )
     }
 
     // Handler: get_ui_tree
     async fn handle_get_ui_tree(&mut self, id: i64) -> Result<()> {
         if let Some(uia) = &self.uia_client {
-            match uia.get_ui_tree(WINDOW_TITLE).await {
+            match uia.get_ui_tree(&self.target_window).await {
                 Ok(tree) => self.write_response(id, tree),
                 Err(e) => self.write_error(id, -32000, format!("Failed to get UI tree: {}", e)),
             }
@@ -347,7 +581,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         };
 
         if let Some(uia) = &self.uia_client {
-            match uia.find_elements_by_name(WINDOW_TITLE, label, exact).await {
+            match uia.find_elements_by_name(&self.target_window, label, exact).await {
                 Ok(elements) => {
                     let result: Vec<Value> = elements
                         .iter()
@@ -382,7 +616,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         };
 
         if let Some(uia) = &self.uia_client {
-            match uia.find_elements_by_role(WINDOW_TITLE, role).await {
+            match uia.find_elements_by_role(&self.target_window, role).await {
                 Ok(elements) => {
                     let result: Vec<Value> = elements
                         .iter()
@@ -417,7 +651,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         };
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_element_by_id(WINDOW_TITLE, element_id).await {
+            match uia.get_element_by_id(&self.target_window, element_id).await {
                 Ok(element) => self.write_response(
                     id,
                     json!({
@@ -448,6 +682,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let x = params.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let y = params.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
+        self.ensure_ipc_connected().await;
         if let Some(client) = self.ipc_client.as_mut() {
             match client.click_at(x, y).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
@@ -463,6 +698,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let x = params.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let y = params.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
+        self.ensure_ipc_connected().await;
         if let Some(client) = self.ipc_client.as_mut() {
             match client.double_click(x, y).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
@@ -478,6 +714,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let x = params.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let y = params.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
+        self.ensure_ipc_connected().await;
         if let Some(client) = self.ipc_client.as_mut() {
             match client.hover(x, y).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
@@ -495,6 +732,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let x2 = params.get("x2").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let y2 = params.get("y2").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
+        self.ensure_ipc_connected().await;
         if let Some(client) = self.ipc_client.as_mut() {
             match client.drag(x1, y1, x2, y2).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
@@ -509,6 +747,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
     async fn handle_keyboard_input(&mut self, id: i64, params: &Value) -> Result<()> {
         let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
 
+        self.ensure_ipc_connected().await;
         if let Some(client) = self.ipc_client.as_mut() {
             match client.keyboard_input(key).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
@@ -524,6 +763,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let delta_x = params.get("delta_x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let delta_y = params.get("delta_y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
+        self.ensure_ipc_connected().await;
         if let Some(client) = self.ipc_client.as_mut() {
             match client.scroll(delta_x, delta_y).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
@@ -538,6 +778,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         &mut self,
         region: Option<UiaRect>,
     ) -> std::result::Result<String, String> {
+        self.ensure_ipc_connected().await;
         let Some(client) = self.ipc_client.as_mut() else {
             return Err("IPC client not connected".to_string());
         };
@@ -613,7 +854,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             return self.write_error(id, -32001, "UI Automation not available".to_string());
         };
 
-        let element = match uia.get_element_by_id(WINDOW_TITLE, element_id).await {
+        let element = match uia.get_element_by_id(&self.target_window, element_id).await {
             Ok(element) => element,
             Err(err) => {
                 return self.write_error(id, -32000, format!("Failed to resolve element: {}", err))
@@ -958,10 +1199,11 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
     async fn handle_set_slider_value(&mut self, id: i64, params: &Value) -> Result<()> {
         let value = params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
+        self.ensure_ipc_connected().await;
         if let Some(client) = self.ipc_client.as_mut() {
             // Find slider using UI Automation
             if let Some(uia) = &self.uia_client {
-                match uia.find_elements_by_role(WINDOW_TITLE, "Slider").await {
+                match uia.find_elements_by_role(&self.target_window, "Slider").await {
                     Ok(sliders) => {
                         if let Some(slider) = sliders.first() {
                             let bounds = &slider.bounds;
@@ -972,30 +1214,19 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
                             let target_x =
                                 slider_x_start + ((value / 100.0) * slider_width as f64) as i32;
 
-                            match client.click_at(slider_x_start, slider_y).await {
-                                Ok(_) => {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100))
-                                        .await;
-                                    match client.hover(target_x, slider_y).await {
-                                        Ok(_) => self.write_response(
-                                            id,
-                                            json!({
-                                                "success": true,
-                                                "value": value,
-                                                "message": format!("Slider set to {}", value)
-                                            }),
-                                        ),
-                                        Err(e) => self.write_error(
-                                            id,
-                                            -32000,
-                                            format!("Failed to drag slider: {}", e),
-                                        ),
-                                    }
-                                }
+                            match client.drag(slider_x_start, slider_y, target_x, slider_y).await {
+                                Ok(_) => self.write_response(
+                                    id,
+                                    json!({
+                                        "success": true,
+                                        "value": value,
+                                        "message": format!("Slider set to {}", value)
+                                    }),
+                                ),
                                 Err(e) => self.write_error(
                                     id,
                                     -32000,
-                                    format!("Failed to click slider: {}", e),
+                                    format!("Failed to drag slider: {}", e),
                                 ),
                             }
                         } else {
@@ -1020,7 +1251,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.focus_element(WINDOW_TITLE, element_id).await {
+            match uia.focus_element(&self.target_window, element_id).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
                 Err(e) => self.write_error(id, -32000, format!("Failed to focus element: {}", e)),
             }
@@ -1037,7 +1268,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_element_value(WINDOW_TITLE, element_id).await {
+            match uia.get_element_value(&self.target_window, element_id).await {
                 Ok(value) => self.write_response(id, json!({"value": value})),
                 Err(e) => self.write_error(id, -32000, format!("Failed to get value: {}", e)),
             }
@@ -1055,7 +1286,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.set_element_value(WINDOW_TITLE, element_id, value).await {
+            match uia.set_element_value(&self.target_window, element_id, value).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
                 Err(e) => self.write_error(id, -32000, format!("Failed to set value: {}", e)),
             }
@@ -1073,7 +1304,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.type_text(WINDOW_TITLE, element_id, text).await {
+            match uia.type_text(&self.target_window, element_id, text).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
                 Err(e) => self.write_error(id, -32000, format!("Failed to type text: {}", e)),
             }
@@ -1090,7 +1321,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.toggle_checkbox(WINDOW_TITLE, element_id).await {
+            match uia.toggle_checkbox(&self.target_window, element_id).await {
                 Ok(new_state) => self.write_response(
                     id,
                     json!({
@@ -1117,7 +1348,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or(false);
 
         if let Some(uia) = &self.uia_client {
-            match uia.set_checkbox(WINDOW_TITLE, element_id, checked).await {
+            match uia.set_checkbox(&self.target_window, element_id, checked).await {
                 Ok(_) => self.write_response(
                     id,
                     json!({
@@ -1145,7 +1376,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
 
         if let Some(uia) = &self.uia_client {
             match uia
-                .select_combobox_option(WINDOW_TITLE, element_id, option_text)
+                .select_combobox_option(&self.target_window, element_id, option_text)
                 .await
             {
                 Ok(_) => self.write_response(
@@ -1170,7 +1401,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_checkbox_state(WINDOW_TITLE, element_id).await {
+            match uia.get_checkbox_state(&self.target_window, element_id).await {
                 Ok(state) => self.write_response(id, json!({"state": state})),
                 Err(e) => {
                     self.write_error(id, -32000, format!("Failed to get checkbox state: {}", e))
@@ -1189,7 +1420,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.clear_text(WINDOW_TITLE, element_id).await {
+            match uia.clear_text(&self.target_window, element_id).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
                 Err(e) => self.write_error(id, -32000, format!("Failed to clear text: {}", e)),
             }
@@ -1206,7 +1437,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_selected_option(WINDOW_TITLE, element_id).await {
+            match uia.get_selected_option(&self.target_window, element_id).await {
                 Ok(option) => self.write_response(id, json!({"option": option})),
                 Err(e) => {
                     self.write_error(id, -32000, format!("Failed to get selected option: {}", e))
@@ -1225,7 +1456,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.select_tab(WINDOW_TITLE, tab_name).await {
+            match uia.select_tab(&self.target_window, tab_name).await {
                 Ok(_) => self.write_response(
                     id,
                     json!({
@@ -1243,7 +1474,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
     // Handler: get_active_tab
     async fn handle_get_active_tab(&mut self, id: i64) -> Result<()> {
         if let Some(uia) = &self.uia_client {
-            match uia.get_active_tab(WINDOW_TITLE).await {
+            match uia.get_active_tab(&self.target_window).await {
                 Ok(tab_name) => self.write_response(id, json!({"tab": tab_name})),
                 Err(e) => self.write_error(id, -32000, format!("Failed to get active tab: {}", e)),
             }
@@ -1277,7 +1508,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
 
         if let Some(uia) = &self.uia_client {
             match uia
-                .wait_for_element(WINDOW_TITLE, element_id, timeout_ms)
+                .wait_for_element(&self.target_window, element_id, timeout_ms)
                 .await
             {
                 Ok(element) => self.write_response(
@@ -1312,7 +1543,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_element_path(WINDOW_TITLE, element_id).await {
+            match uia.get_element_path(&self.target_window, element_id).await {
                 Ok(path) => self.write_response(id, json!({"path": path})),
                 Err(e) => {
                     self.write_error(id, -32000, format!("Failed to get element path: {}", e))
@@ -1365,7 +1596,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_supported_patterns(WINDOW_TITLE, element_id).await {
+            match uia.get_supported_patterns(&self.target_window, element_id).await {
                 Ok(patterns) => self.write_response(id, json!({"patterns": patterns})),
                 Err(e) => self.write_error(id, -32000, format!("Failed to get patterns: {}", e)),
             }
@@ -1377,7 +1608,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
     // Handler: find_all_interactive_elements
     async fn handle_find_all_interactive_elements(&mut self, id: i64) -> Result<()> {
         if let Some(uia) = &self.uia_client {
-            match uia.find_all_interactive_elements(WINDOW_TITLE).await {
+            match uia.find_all_interactive_elements(&self.target_window).await {
                 Ok(elements) => {
                     let elements_json: Vec<Value> = elements
                         .iter()
@@ -1426,7 +1657,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_element_debug_info(WINDOW_TITLE, element_id).await {
+            match uia.get_element_debug_info(&self.target_window, element_id).await {
                 Ok(debug_info) => self.write_response(id, debug_info),
                 Err(e) => self.write_error(id, -32000, format!("Failed to get debug info: {}", e)),
             }
@@ -1443,7 +1674,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or(5) as i32;
 
         if let Some(uia) = &self.uia_client {
-            match uia.dump_ui_tree_detailed(WINDOW_TITLE, max_depth).await {
+            match uia.dump_ui_tree_detailed(&self.target_window, max_depth).await {
                 Ok(tree) => self.write_response(id, tree),
                 Err(e) => self.write_error(id, -32000, format!("Failed to dump UI tree: {}", e)),
             }
@@ -1460,7 +1691,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_element_siblings(WINDOW_TITLE, element_id).await {
+            match uia.get_element_siblings(&self.target_window, element_id).await {
                 Ok(siblings) => {
                     let siblings_json: Vec<Value> = siblings
                         .iter()
@@ -1502,7 +1733,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_center_point(WINDOW_TITLE, element_id).await {
+            match uia.get_center_point(&self.target_window, element_id).await {
                 Ok((x, y)) => self.write_response(id, json!({"x": x, "y": y})),
                 Err(e) => {
                     self.write_error(id, -32000, format!("Failed to get center point: {}", e))
@@ -1521,8 +1752,9 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.click_center(WINDOW_TITLE, element_id).await {
+            match uia.click_center(&self.target_window, element_id).await {
                 Ok((x, y)) => {
+                    self.ensure_ipc_connected().await;
                     if let Some(ipc) = &mut self.ipc_client {
                         match ipc.click_at(x, y).await {
                             Ok(_) => self.write_response(
@@ -1566,7 +1798,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
 
         if let Some(uia) = &self.uia_client {
             match uia
-                .find_nearest_interactive_element(WINDOW_TITLE, x, y, max_distance)
+                .find_nearest_interactive_element(&self.target_window, x, y, max_distance)
                 .await
             {
                 Ok((element, distance)) => {
@@ -1608,7 +1840,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.activate_element(WINDOW_TITLE, element_id).await {
+            match uia.activate_element(&self.target_window, element_id).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
                 Err(e) => {
                     self.write_error(id, -32000, format!("Failed to activate element: {}", e))
@@ -1653,7 +1885,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or("");
 
         if let Some(uia) = &self.uia_client {
-            match uia.scroll_to_element(WINDOW_TITLE, element_id).await {
+            match uia.scroll_to_element(&self.target_window, element_id).await {
                 Ok(_) => self.write_response(id, json!({"success": true})),
                 Err(e) => {
                     self.write_error(id, -32000, format!("Failed to scroll to element: {}", e))
@@ -1669,10 +1901,14 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         let x = params.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let y = params.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
-        // Call input module directly (not through IPC)
-        match egui_mcp_client_win::input::send_right_click(x, y) {
-            Ok(_) => self.write_response(id, json!({"success": true})),
-            Err(e) => self.write_error(id, -32000, format!("Failed to right click: {}", e)),
+        self.ensure_ipc_connected().await;
+        if let Some(client) = self.ipc_client.as_mut() {
+            match client.right_click_at(x, y).await {
+                Ok(_) => self.write_response(id, json!({"success": true})),
+                Err(e) => self.write_error(id, -32000, format!("Failed to right click: {}", e)),
+            }
+        } else {
+            self.write_error(id, -32001, "IPC client not connected".to_string())
         }
     }
 
@@ -1684,15 +1920,24 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         };
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_center_point(WINDOW_TITLE, element_id).await {
-                Ok((x, y)) => match egui_mcp_client_win::input::send_right_click(x, y) {
-                    Ok(_) => self.write_response(id, json!({"success": true, "x": x, "y": y})),
-                    Err(e) => self.write_error(
-                        id,
-                        -32000,
-                        format!("Failed to right click element center: {}", e),
-                    ),
-                },
+            match uia.get_center_point(&self.target_window, element_id).await {
+                Ok((x, y)) => {
+                    self.ensure_ipc_connected().await;
+                    if let Some(client) = self.ipc_client.as_mut() {
+                        match client.right_click_at(x, y).await {
+                            Ok(_) => {
+                                self.write_response(id, json!({"success": true, "x": x, "y": y}))
+                            }
+                            Err(e) => self.write_error(
+                                id,
+                                -32000,
+                                format!("Failed to right click element center: {}", e),
+                            ),
+                        }
+                    } else {
+                        self.write_error(id, -32001, "IPC client not connected".to_string())
+                    }
+                }
                 Err(e) => self.write_error(
                     id,
                     -32000,
@@ -1721,7 +1966,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or(true);
 
         if let Some(uia) = &self.uia_client {
-            match uia.find_elements_by_name(WINDOW_TITLE, label, exact).await {
+            match uia.find_elements_by_name(&self.target_window, label, exact).await {
                 Ok(elements) => {
                     let menu_item = elements
                         .iter()
@@ -1735,7 +1980,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
                         );
                     };
 
-                    match uia.activate_element(WINDOW_TITLE, &target.id).await {
+                    match uia.activate_element(&self.target_window, &target.id).await {
                         Ok(_) => self.write_response(
                             id,
                             json!({
@@ -1776,33 +2021,38 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or(40);
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_element_by_id(WINDOW_TITLE, element_id).await {
+            match uia.get_element_by_id(&self.target_window, element_id).await {
                 Ok(element) => {
                     let points = flash_points_for_rect(&element.bounds);
-                    for (x, y) in points {
-                        if let Err(e) = egui_mcp_client_win::input::send_mouse_move(x, y) {
-                            return self.write_error(
-                                id,
-                                -32000,
-                                format!("Failed to highlight element: {}", e),
-                            );
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                    }
-
-                    self.write_response(
-                        id,
-                        json!({
-                            "success": true,
-                            "element_id": element.id,
-                            "bounds": {
-                                "x": element.bounds.x,
-                                "y": element.bounds.y,
-                                "width": element.bounds.width,
-                                "height": element.bounds.height
+                    self.ensure_ipc_connected().await;
+                    if let Some(client) = self.ipc_client.as_mut() {
+                        for (x, y) in points {
+                            if let Err(e) = client.hover(x, y).await {
+                                return self.write_error(
+                                    id,
+                                    -32000,
+                                    format!("Failed to highlight element: {}", e),
+                                );
                             }
-                        }),
-                    )
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        }
+
+                        self.write_response(
+                            id,
+                            json!({
+                                "success": true,
+                                "element_id": element.id,
+                                "bounds": {
+                                    "x": element.bounds.x,
+                                    "y": element.bounds.y,
+                                    "width": element.bounds.width,
+                                    "height": element.bounds.height
+                                }
+                            }),
+                        )
+                    } else {
+                        self.write_error(id, -32001, "IPC client not connected".to_string())
+                    }
                 }
                 Err(e) => self.write_error(id, -32000, format!("Failed to get element: {}", e)),
             }
@@ -1824,30 +2074,35 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             .unwrap_or(60);
 
         if let Some(uia) = &self.uia_client {
-            match uia.get_element_by_id(WINDOW_TITLE, element_id).await {
+            match uia.get_element_by_id(&self.target_window, element_id).await {
                 Ok(element) => {
                     let points = flash_points_for_rect(&element.bounds);
-                    for _ in 0..flashes.max(1) {
-                        for (x, y) in &points {
-                            if let Err(e) = egui_mcp_client_win::input::send_mouse_move(*x, *y) {
-                                return self.write_error(
-                                    id,
-                                    -32000,
-                                    format!("Failed to flash element: {}", e),
-                                );
+                    self.ensure_ipc_connected().await;
+                    if let Some(client) = self.ipc_client.as_mut() {
+                        for _ in 0..flashes.max(1) {
+                            for (x, y) in &points {
+                                if let Err(e) = client.hover(*x, *y).await {
+                                    return self.write_error(
+                                        id,
+                                        -32000,
+                                        format!("Failed to flash element: {}", e),
+                                    );
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                         }
-                    }
 
-                    self.write_response(
-                        id,
-                        json!({
-                            "success": true,
-                            "element_id": element.id,
-                            "flashes": flashes.max(1)
-                        }),
-                    )
+                        self.write_response(
+                            id,
+                            json!({
+                                "success": true,
+                                "element_id": element.id,
+                                "flashes": flashes.max(1)
+                            }),
+                        )
+                    } else {
+                        self.write_error(id, -32001, "IPC client not connected".to_string())
+                    }
                 }
                 Err(e) => self.write_error(id, -32000, format!("Failed to get element: {}", e)),
             }
@@ -1878,7 +2133,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         if let Some(uia) = &self.uia_client {
             match uia
                 .wait_for_element_stable(
-                    WINDOW_TITLE,
+                    &self.target_window,
                     element_id,
                     stable_ms,
                     timeout_ms,
@@ -1931,7 +2186,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         if let Some(uia) = &self.uia_client {
             match uia
                 .wait_for_value_change(
-                    WINDOW_TITLE,
+                    &self.target_window,
                     element_id,
                     initial_value,
                     timeout_ms,
@@ -1976,13 +2231,27 @@ impl EguiMcpServer {
 
         info!("Server ready, waiting for MCP messages...");
 
+        // `read_line_raw` blocks until input arrives, so this loop never spins.
         loop {
-            if let Some(message) = server.read_message()? {
-                info!("Received message: {:?}", message);
-                server.handle_message(&message).await?;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            let Some(line) = server.read_line_raw()? else {
+                info!("Input stream closed by peer; shutting down.");
+                break;
+            };
+
+            // A malformed line must not take the session down with it.
+            let message: Value = match serde_json::from_str(line.trim()) {
+                Ok(message) => message,
+                Err(err) => {
+                    error!("Ignoring unparseable message: {}", err);
+                    continue;
+                }
+            };
+
+            info!("Received message: {:?}", message);
+            server.handle_message(&message).await?;
         }
+
+        Ok(())
     }
 }
 
