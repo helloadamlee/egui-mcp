@@ -4,6 +4,8 @@
 
 A Windows port of [egui-mcp](https://github.com/dijdzv/egui-mcp) (Linux/AT-SPI). The original uses AT-SPI over D-Bus; this version replaces that with **Windows UI Automation (UIA) via COM** — no WSL, no D-Bus required.
 
+[![Release](https://img.shields.io/github/v/release/helloadamlee/egui-mcp?logo=github)](https://github.com/helloadamlee/egui-mcp/releases)
+[![CI](https://github.com/helloadamlee/egui-mcp/actions/workflows/windows-ci.yml/badge.svg)](https://github.com/helloadamlee/egui-mcp/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org/)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows)](#requirements)
@@ -14,11 +16,11 @@ A Windows port of [egui-mcp](https://github.com/dijdzv/egui-mcp) (Linux/AT-SPI).
 
 ```
 MCP Client (AI Agent)
-       │ stdio
+       │ stdio (JSON-RPC)
        ▼
 egui-mcp-server-win
-  ├── UIA Client (COM)      → UI tree & element actions
-  └── IPC Client ( Named Pipe) → screenshots, perf, logs
+  ├── UIA Client (COM)         → UI tree & element actions
+  └── IPC Client (Named Pipe)  → screenshots, mouse & keyboard input
        ▲
 egui Application  →  enable_accesskit()  →  AccessKit  →  UIA
 ```
@@ -30,12 +32,12 @@ egui Application  →  enable_accesskit()  →  AccessKit  →  UIA
 | Feature | Linux (original) | Windows (this port) |
 |---|---|---|
 | **Accessibility API** | AT-SPI over D-Bus | Windows UI Automation (COM) |
-| **IPC transport** | Unix socket | Named pipe |
+| **IPC transport** | Unix socket | Named pipe (`\\.\pipe\egui_mcp_client`) |
 | **Platform** | Linux only | Windows 10 / 11 |
 | **Installation** | `cargo install egui-mcp-server` (crates.io) | Build from source |
 | `get_ui_tree` / `find_by_*` / `get_element` | ✅ | ✅ |
 | `click_element`, `focus_element` | ✅ | ✅ |
-| `click_at`, `hover`, `drag`, `scroll`, `keyboard_input` | ✅ | ✅ |
+| `click_at`, `right_click_at`, `hover`, `drag`, `scroll`, `keyboard_input` | ✅ | ✅ |
 | `take_screenshot`, `screenshot_region` | ✅ | ✅ |
 | `highlight_element`, `clear_highlights` | ✅ AT-SPI + IPC | ✅ cursor-trace |
 | `wait_for_element` | ✅ | ✅ |
@@ -47,7 +49,7 @@ egui Application  →  enable_accesskit()  →  AccessKit  →  UIA
 | `screenshot_element` | ✅ | ✅ restored |
 | `wait_for_state` | ✅ | ❌ removed |
 | `compare_screenshots`, `diff_screenshots` | ✅ | ✅ restored |
-| `save/load/diff_snapshots` | ✅ | ✅ restored (`diff_current` pending) |
+| `save_snapshot`, `load_snapshot`, `diff_snapshots` | ✅ | ✅ restored |
 | `get_frame_stats`, `start_perf_recording`, `get_perf_report` | ✅ | ❌ removed |
 | `get_logs`, `clear_logs` | ✅ | ❌ removed |
 | **`get_window_list`** | ❌ | ✅ **new** |
@@ -96,23 +98,30 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use egui_mcp_client_win::McpClient;
-
-fn main() {
-    let mcp_client = McpClient::new();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let client_clone = mcp_client.clone();
-    runtime.spawn(async move {
-        egui_mcp_client_win::IpcServer::run(client_clone).await.ok();
+#[tokio::main]
+async fn main() -> Result<(), eframe::Error> {
+    // 1. Initialize and spawn the background IPC server for egui-mcp
+    let mcp_client = egui_mcp_client_win::init()
+        .await
+        .expect("Failed to initialize egui-mcp client");
+    tokio::spawn(async move {
+        let _ = mcp_client.run().await;
     });
-    eframe::run_native("My App", Default::default(), Box::new(|cc| {
-        cc.egui_ctx.enable_accesskit(); // publishes UI tree to UIA
-        Ok(Box::new(MyApp { mcp_client, runtime }))
-    })).unwrap();
+
+    // 2. Launch your eframe application with AccessKit enabled
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "My App",
+        options,
+        Box::new(|cc| {
+            cc.egui_ctx.enable_accesskit(); // Publishes UI tree to Windows UIA
+            Ok(Box::new(MyApp::default()))
+        }),
+    )
 }
 ```
 
-**2. Configure your MCP client** (e.g. Claude Desktop):
+**2. Configure your MCP client** (e.g. Claude Desktop, Antigravity, or Cursor):
 
 ```json
 {
@@ -153,9 +162,9 @@ Call `get_window_list` to see every title UIA can currently see, and
 ## Windows Notes
 
 - **COM** is initialized automatically by the server.
-- **Elevated privileges** may be needed if the target app runs as Administrator.
-- **Antivirus** — add an exclusion for `egui-mcp-server-win.exe` if flagged.
-- **Inspect.exe** (Windows SDK) is useful for verifying the UIA tree exposed by your app.
+- **Elevation / Permissions**: Standard user permissions work out of the box. If your egui app is running elevated (*Run as Administrator*), ensure `egui-mcp-server-win.exe` is also run elevated so Windows UIPI does not block synthesized input.
+- **Antivirus**: Add a temporary exclusion for `egui-mcp-server-win.exe` if flagged during local builds.
+- **Inspect.exe** (Windows SDK) is useful for visually inspecting the UIA element hierarchy exposed by your app.
 
 ### Known Limitations
 
